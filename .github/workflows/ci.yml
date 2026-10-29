@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: stillfs_test
+          POSTGRES_USER: stillfs
+          POSTGRES_PASSWORD: stillfs-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stillfs -d stillfs_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      STILLFS_TEST_DATABASE_URL: postgres://stillfs:stillfs-test-password@localhost:5432/stillfs_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+      - run: test -z "$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build -o /tmp/stillfs-server ./cmd/stillfs
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run check
+        working-directory: web
+      - run: npm run build
+        working-directory: web

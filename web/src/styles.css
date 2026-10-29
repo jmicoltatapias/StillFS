@@ -1,0 +1,40 @@
+:root { font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif; color: #172238; background: #f7f9fc; font-synthesis: none; text-rendering: optimizeLegibility; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button { font: inherit; }
+.shell { min-height: 100vh; display: flex; }
+.sidebar { width: 248px; background: #101a2b; color: #dce4f0; padding: 27px 16px 20px; display: flex; flex-direction: column; flex-shrink: 0; }
+.brand { color: white; text-decoration: none; display: flex; align-items: center; gap: 11px; padding: 0 9px; font: 800 20px 'Avenir Next', Avenir, sans-serif; letter-spacing: -.5px; }
+.brand-mark { width: 30px; height: 30px; display: grid; place-items: center; background: #3c78f6; border-radius: 9px; font-size: 17px; }
+.nav-label { color: #77849b; font-size: 10px; font-weight: 700; letter-spacing: 1.2px; margin: 45px 11px 13px; }
+.sidebar nav { display: grid; gap: 5px; }
+.nav-item { color: #aeb9ca; border: 0; background: transparent; border-radius: 8px; text-align: left; padding: 11px 12px; font-size: 13px; cursor: pointer; display: flex; gap: 12px; align-items: center; }
+.nav-item span { font-size: 16px; width: 17px; text-align: center; }
+.nav-item:hover { background: #1a2940; color: white; }
+.nav-item.active { background: #20324e; color: white; font-weight: 600; }
+.sidebar-foot { margin-top: auto; border-top: 1px solid #28354a; padding: 17px 8px 0; color: #77849b; font-size: 11px; }
+.main { flex: 1; min-width: 0; }
+.topbar { height: 65px; border-bottom: 1px solid #e7ebf1; display: flex; align-items: center; justify-content: space-between; padding: 0 40px; color: #7b8798; font-size: 12px; background: #fff; }
+.phase { color: #52647e; background: #f0f4fa; border-radius: 20px; padding: 6px 11px; font-size: 11px; }
+.content { max-width: 940px; padding: 68px 48px; margin: 0 auto; }
+.eyebrow { color: #3973e6; font-weight: 700; font-size: 10px; letter-spacing: 1.45px; margin: 0 0 13px; }
+h1 { font: 700 31px 'Avenir Next', Avenir, sans-serif; letter-spacing: -1px; margin: 0; color: #142039; }
+.intro { color: #718096; font-size: 14px; line-height: 1.7; max-width: 570px; margin: 12px 0 27px; }
+.primary { border: 0; background: #3475ed; color: white; border-radius: 7px; padding: 11px 15px; font-size: 12px; font-weight: 600; cursor: pointer; box-shadow: 0 4px 10px #3475ed30; }
+.primary:hover { background: #2866da; }
+.primary span { padding-left: 8px; }
+.note-card,.status-card { background: white; border: 1px solid #e7ebf1; border-radius: 10px; box-shadow: 0 3px 12px #15254008; }
+.note-card { display: flex; align-items: flex-start; gap: 14px; margin-top: 48px; max-width: 690px; padding: 19px 20px; }
+.note-icon { display: grid; place-items: center; width: 25px; height: 25px; border-radius: 50%; color: #3973e6; background: #edf3ff; font-size: 13px; font-weight: 700; }
+.note-card h2,.status-card h2 { font: 700 13px 'Avenir Next', Avenir, sans-serif; margin: 2px 0 5px; }
+.note-card p,.status-heading p { color: #8490a1; font-size: 12px; margin: 0; }
+.status-card { max-width: 700px; padding: 22px 24px 8px; }
+.status-heading { display: flex; justify-content: space-between; align-items: center; padding-bottom: 22px; }
+.badge { display: inline-flex; align-items: center; gap: 7px; border-radius: 20px; padding: 6px 10px; font-size: 10px; font-weight: 600; }
+.badge i { display: block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.badge.good { background: #e8f7ef; color: #268452; }.badge.pending { background: #f2f4f7; color: #778397; }.badge.danger { background: #fff0ee; color: #bd4d40; }
+.status-row { display: flex; justify-content: space-between; border-top: 1px solid #edf0f4; padding: 15px 0; font-size: 12px; color: #65738a; }
+.status-row strong { color: #27374f; font-size: 11px; font-weight: 600; }
+.error-message { margin: 4px 0 14px; color: #a33d34; font-size: 12px; }
+.status-footnote { color: #929dad; font-size: 11px; margin-top: 14px; }
+@media (max-width: 680px) { .sidebar { width: 60px; padding: 22px 8px; } .brand { padding: 0 7px; } .brand > span:last-child,.nav-label,.sidebar-foot { display: none; } .nav-item { padding: 10px; font-size: 0; } .nav-item span { font-size: 16px; } .topbar { padding: 0 18px; } .content { padding: 46px 22px; } h1 { font-size: 26px; } }

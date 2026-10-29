@@ -1,0 +1,104 @@
+Voy a recorrer el repositorio en modo de solo lectura: primero ubicaré módulos, comandos y paquetes; luego seguiré las llamadas desde el arranque hasta API, persistencia, autenticación y pruebas. Separaré lo que el código demuestra directamente de las inferencias sobre diseño o comportamiento.
+• Ran pwd && rg --files -g 'AGENTS.md' -g 'go.mod' -g '*.go' -g 'Makefile' -g 'README*' -g '*.yaml' -g '*.yml' | head -240
+  └ cmd/typed-errors.go
+    cmd/os_windows.go
+    cmd/config-common.go
+• Explored
+  └ Read main.go
+    Read server-main.go
+    Search func (Main|serverMain|new.*Server|register.*API|register.*Handler)|New.*ObjectLayer|New.*Erasure|New.*FS|register.*Route|New.*API|auth|Authenticate|Signat…
+• Ran sed -n '730,880p' cmd/server-main.go; sed -n '880,1040p' cmd/server-main.go; sed -n '1180,1290p' cmd/server-main.go; rg -n '^func (Main|registerAPIRouter|regis…
+  └ cmd/erasure-healing_test.go
+    cmd/erasure-encode.go
+    cmd/xl-storage-format-utils.go
+El repositorio está organizado principalmente en cmd (arranque, HTTP, S3 y capa de objetos) e internal (utilidades compartidas, autenticación criptográfica, transporte y subsistemas). Estoy siguiendo ahora los límites entre el router HTTP y ObjectLayer, y entre metadatos IAM y los metadatos de objetos, para no mezclar responsabilidades distintas.
+• Explored
+  └ Read main.go
+    Read api-router.go
+    Read api-router.go
+• Ran rg -n '^type ObjectLayer|interface \{' cmd/object-api-interface.go; rg -n '^func \(.*\) (PutObject|GetObject|DeleteObject)' cmd/erasure-object.go cmd/erasure-s…
+  └ cmd/erasure-server-pool.go:2847:func (z *erasureServerPools) DeleteObjectTags(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error)…
+    cmd/erasure-server-pool.go:2875:func (z *erasureServerPools) GetObjectTags(ctx context.Context, bucket, object string, opts ObjectOptions) (*tags.Tags, error) {
+    cmd/erasure-multipart.go:575:func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, r *PutObjReader, opts Objec…
+• Ran sed -n '246,320p' cmd/object-api-interface.go; sed -n '1060,1155p' cmd/erasure-server-pool.go; sed -n '1249,1395p' cmd/erasure-object.go; rg -n 'xl.meta|xlMeta…
+  └ cmd/erasure-heal_test.go:79:            t.Fatalf("Test %d: failed to create ErasureStorage: %v", i, err)
+    cmd/erasure-metadata_test.go:32:// Test FileInfo.AddObjectPart()
+    cmd/erasure-metadata_test.go:33:func TestAddObjectPart(t *testing.T) {
+## Resumen del recorrido
+
+El punto de entrada del ejecutable es main.go (main.go:31): main() delega en minio.Main(os.Args). La aplicación define el comando server en cmd/server-main.go (serverCmd, con Action: serverMain), y cmd/main.go (cmd/main.go:201) implementa Main(), que crea y ejecuta la aplicación CLI.
+
+El núcleo del servidor está en cmd; internal aporta infraestructura transversal, como HTTP, autenticación, hashing, KMS, locks y transporte RPC. Aunque el repositorio se llama LibreFS, el código analizado conserva el diseño y los nombres de paquete del servidor MinIO.
+
+## Paquetes y componentes principales
+
+- cmd — servidor y dominio de almacenamiento. Incluye el arranque, los routers, handlers S3 y administrativos, IAM, la interfaz de objetos, almacenamiento erasure coded y metadatos.
+- internal/auth — credenciales y tipos de autenticación. Se usa desde cmd para representar credenciales y verificar solicitudes.
+- internal/http — servidor y componentes HTTP compartidos. serverMain configura el servidor con xhttp.NewServer(...).
+- internal/grid y REST interno — comunicación entre nodos. cmd/routers.go (cmd/routers.go:28) registra rutas de almacenamiento, peer, bootstrap y locks para despliegues distribuidos.
+- internal/crypto y internal/kms — cifrado y gestión de claves. IAM puede cifrar su configuración con KMS desde cmd/iam-object-store.go (cmd/iam-object-store.go:84).
+- internal/config, internal/logger, internal/ioutil y otros paquetes internos suministran configuración, logging y utilidades.
+
+## Arranque del servidor
+
+La secuencia visible en serverMain() de cmd/server-main.go (cmd/server-main.go:746) es:
+
+1. Registra señales y configura logging y entorno.
+2. buildServerCtxt y serverHandleCmdArgs preparan los endpoints y discos.
+3. Ejecuta comprobaciones de erasure, inicializa KMS y carga credenciales raíz; authenticateNode genera credenciales para tráfico interno.
+4. initAllSubsystems inicializa subsistemas.
+5. Inicializa los servicios Grid y de locks.
+6. configureServerHandler construye el router HTTP y xhttp.NewServer(...) crea y arranca el listener.
+7. newObjectLayer delega en newErasureServerPools.
+8. Espera salud de lectura y ejecuta initServerConfig.
+9. Inicializa IAM en segundo plano con globalIAMSys.Init(...); según configuración, también inicia Console, FTP y SFTP.
+
+La ruta concreta para crear la capa de objetos es serverMain() → newObjectLayer() → newErasureServerPools() en cmd/erasure-server-pool.go (cmd/erasure-server-pool.go:78). Esta última inicializa pools y discos a partir de EndpointServerPools.
+
+## API S3 y autenticación
+
+cmd/routers.go (cmd/routers.go:84) configura el router y registra las rutas S3 mediante registerAPIRouter(). En cmd/api-router.go (cmd/api-router.go:255), el router crea objectAPIHandlers con ObjectAPI: newObjectLayerFn y asigna métodos HTTP a handlers como GetObjectHandler, PutObjectHandler y DeleteObjectHandler. Las rutas pasan por s3APIMiddleware.
+
+Las middlewares globales se aplican en configureServerHandler(). Entre ellas, setAuthMiddleware, que enruta o valida solicitudes según el tipo de autenticación. En cmd/auth-handler.go (cmd/auth-handler.go:357), authenticateRequest() trata firmas V2 y V4; isReqAuthenticated() verifica firma V4 y prepara la comprobación del digest del cuerpo. La autorización posterior se hace en authorizeRequest(), que consulta contexto de credenciales y políticas.
+
+Flujo de una operación S3: router → middleware y autenticación → handler HTTP → ObjectLayer → implementación de almacenamiento. Por ejemplo, PutObjectHandler() está en cmd/object-handlers.go (cmd/object-handlers.go:1793); ObjectLayer.PutObject() se define en cmd/object-api-interface.go (cmd/object-api-interface.go:246).
+
+## Objetos y metadatos
+
+ObjectLayer es la interfaz que separa los handlers de la implementación: declara operaciones de bucket, objeto, multipart, healing y etiquetas en cmd/object-api-interface.go (cmd/object-api-interface.go:246).
+
+La implementación de pools, erasureServerPools, distribuye operaciones entre los pools y las delega a erasureSets; por ejemplo, PutObject() está en cmd/erasure-server-pool.go (cmd/erasure-server-pool.go:1085). La lógica de objeto erasure coded vive en erasureObjects: putObject() en cmd/erasure-object.go (cmd/erasure-object.go:1249) prepara bloques de datos y paridad y guarda metadatos por disco. GetObjectNInfo() y DeleteObject() están también en ese paquete de implementación.
+
+El formato de metadatos de objetos es xl.meta: la constante xlStorageFormatFile aparece en cmd/xl-storage.go (cmd/xl-storage.go:69). writeAllMetadataWithRevert() escribe xl.meta en discos concurrentemente en cmd/erasure-metadata.go (cmd/erasure-metadata.go:406); xlStorage.WriteMetadata() y writeAllMeta() realizan la escritura a nivel de almacenamiento en cmd/xl-storage.go (cmd/xl-storage.go:1463) y cmd/xl-storage.go (cmd/xl-storage.go:2211).
+
+IAM es un subsistema distinto de los metadatos xl.meta de cada objeto. cmd/iam-object-store.go (cmd/iam-object-store.go:43) define IAMObjectStore, que implementa el almacenamiento de configuración IAM sobre ObjectLayer; saveIAMConfig() serializa los datos y, si existe KMS, los cifra antes de persistirlos. IAMSys.Init() se invoca durante el arranque en serverMain().
+
+## Mapa de dependencias
+
+main.go
+  └─ cmd.Main → CLI → serverMain
+       ├─ configureServerHandler
+       │    ├─ middlewares globales / autenticación
+       │    ├─ registerAPIRouter → objectAPIHandlers
+       │    ├─ rutas admin, STS, KMS, métricas y salud
+       │    └─ REST/Grid/locks si el despliegue es distribuido
+       ├─ newObjectLayer → newErasureServerPools
+       │    └─ erasureSets → erasureObjects → StorageAPI / xlStorage
+       │                              └─ datos + xl.meta en discos
+       └─ globalIAMSys.Init
+            └─ IAMObjectStore → ObjectLayer
+                 └─ archivos de configuración IAM (cifrables con KMS)
+
+Este mapa resume llamadas y referencias comprobables en los archivos citados; no pretende enumerar todos los paquetes transitivos de Go.
+
+## Pruebas
+
+Encontré una suite amplia en cmd: el inventario incluye 144 archivos *_test.go. Las pruebas cubren distintos niveles: handlers S3, firmas y autenticación, operaciones de objetos, formatos erasure y metadatos, IAM, REST y utilidades. Ejemplos: TestGetBucketLocationHandler en cmd/bucket-handlers_test.go (cmd/bucket-handlers_test.go:80), TestS3SupportedAuthType en cmd/auth-handler_test.go (cmd/auth-handler_test.go:139), pruebas de escritura en cmd/object-api-putobject_test.go (cmd/object-api-putobject_test.go:45) y pruebas de formatos en cmd/xl-storage-format-v2_test.go.
+
+No ejecuté pruebas: el análisis solicitado era de solo lectura y no pedía verificación por ejecución.
+
+## Hechos comprobados e hipótesis
+
+Hechos comprobados por el código: el ejecutable delega a cmd.Main; el comando server ejecuta serverMain; el servidor registra un router S3 con handlers y middlewares; ObjectLayer es la interfaz de operaciones; newObjectLayer crea pools erasure; xl.meta se escribe por disco; IAM puede persistirse mediante ObjectLayer y cifrarse con KMS.
+
+Hipótesis o interpretación: el diagrama refleja el flujo de llamadas principal y no demuestra por sí solo todas las garantías de consistencia, recuperación ante fallos o disponibilidad de cada operación. El uso de pools, erasure coding, quórums y escritura concurrente sugiere tolerancia a fallos de disco, pero las garantías concretas dependen del algoritmo y de las condiciones de quórum de cada ruta; este recorrido no las evalúa exhaustivamente.
