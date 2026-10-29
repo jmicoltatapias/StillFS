@@ -47,7 +47,21 @@ reversed or checksum-validated; applied files must be treated as immutable.
   earlier inserts cannot, and deleted rows disappear.
 - PostgreSQL cannot atomically commit an external object-store operation.
   `Put`/`Update` only persist or replace the opaque reference; `Delete` removes
-  metadata only. Failed or reordered object-store operations can leave orphaned
-  bytes or stale references. No cleanup protocol is defined here.
+  metadata only. The object coordinator supplies best-effort single-process
+  compensation, but failed or reordered operations can still leave orphaned
+  bytes or stale references. `ListStorageReferences` supports a read-only
+  diagnostic; it is paginated and does not share a snapshot across pages.
+  Diagnostic mismatches are not safe-delete decisions, and no automatic blob
+  reconciler exists.
 - Object versioning, lifecycle, IAM, bucket policies, replication, and S3
   compatibility rules remain outside this schema.
+
+## Task 004 identity extension
+
+Migration `0002_identity_ownership.sql` adds `principals`, encrypted
+`credentials`, and nullable `buckets.owner_id`. Nullable ownership preserves
+legacy rows without assigning them to a new principal; S3 queries filter by
+owner and do not expose unowned buckets. New bucket creation requires a
+principal ID. Credential ciphertext uses AES-256-GCM in `BYTEA`, with its
+nonce stored separately and a required external master key. This is credential
+material, not object payload data or an IAM policy model.

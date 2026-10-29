@@ -12,3 +12,7 @@ only an initial check: license texts and conditions have not been individually
 reviewed, nor have distribution obligations and compatibility with the
 project's AGPL terms. This document is not legal advice or a completed legal
 review.
+
+The isolated AWS SDK for Go v2 compatibility test uses Apache-2.0 licensed
+AWS modules and Smithy Go. These are test-only dependencies in
+`tests/s3compat/go.mod`; they are not imported by StillFS server binaries.

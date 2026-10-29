@@ -22,7 +22,7 @@ func TestPutAndOpenCoordinatesBytesAndMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	stored := metadata.get(id)
-	if stored.StorageRef == "" || stored.ContentLength != int64(len(content)) || stored.ContentType != "text/plain" || stored.ChecksumAlgorithm != "sha256" || stored.Checksum == "" || stored.ETag != "" {
+	if stored.StorageRef == "" || stored.ContentLength != int64(len(content)) || stored.ContentType != "text/plain" || stored.ChecksumAlgorithm != "sha256" || stored.Checksum == "" || stored.ETag != `"sha256-`+stored.Checksum+`"` {
 		t.Fatalf("unexpected persisted metadata: %#v", stored)
 	}
 	if referenced, err := metadata.IsStorageRefReferenced(context.Background(), stored.StorageRef); err != nil || !referenced {
@@ -42,6 +42,47 @@ func TestPutAndOpenCoordinatesBytesAndMetadata(t *testing.T) {
 	}
 	if logs.Len() != 0 {
 		t.Fatalf("unexpected error logs: %s", logs.String())
+	}
+}
+
+func TestDeleteRemovesMetadataAndUnreferencedBytes(t *testing.T) {
+	objects, metadata, _ := newTestService(t)
+	id := storage.ObjectID{Bucket: "bucket", Key: "delete"}
+	if err := objects.Put(context.Background(), id, "", strings.NewReader("delete me")); err != nil {
+		t.Fatal(err)
+	}
+	reference := metadata.get(id).StorageRef
+	if err := objects.Delete(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.Get(context.Background(), id); !errors.Is(err, storage.ErrObjectNotFound) {
+		t.Fatalf("metadata remains after Delete: %v", err)
+	}
+	if _, err := objects.bytes.Stat(context.Background(), reference); !errors.Is(err, storage.ErrContentNotFound) {
+		t.Fatalf("content remains after Delete: %v", err)
+	}
+}
+
+func TestPutOrReplaceAllowsS3StyleRepeatedPut(t *testing.T) {
+	objects, metadata, _ := newTestService(t)
+	id := storage.ObjectID{Bucket: "bucket", Key: "upsert"}
+	for _, content := range []string{"first", "second"} {
+		if err := objects.PutOrReplace(context.Background(), id, "text/plain", strings.NewReader(content)); err != nil {
+			t.Fatalf("PutOrReplace(%q): %v", content, err)
+		}
+	}
+	stored := metadata.get(id)
+	if stored.ContentLength != int64(len("second")) {
+		t.Fatalf("replacement metadata = %#v", stored)
+	}
+	_, reader, err := objects.Open(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || string(data) != "second" {
+		t.Fatalf("replacement content = %q, errors=%v/%v", data, readErr, closeErr)
 	}
 }
 
@@ -113,6 +154,71 @@ func TestReplacementLeavesOldBlobForSafeReconciliation(t *testing.T) {
 	}
 	if _, err := objects.bytes.Stat(context.Background(), old); err != nil {
 		t.Fatalf("old blob was deleted by replacement: %v", err)
+	}
+}
+
+func TestReaderRemainsValidAcrossReplaceAndDelete(t *testing.T) {
+	objects, _, _ := newTestService(t)
+	id := storage.ObjectID{Bucket: "bucket", Key: "open-during-mutation"}
+	if err := objects.Put(context.Background(), id, "text/plain", strings.NewReader("before")); err != nil {
+		t.Fatal(err)
+	}
+	_, beforeReader, err := objects.Open(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := objects.Replace(context.Background(), id, "text/plain", strings.NewReader("after replacement")); err != nil {
+		t.Fatal(err)
+	}
+	before, err := io.ReadAll(beforeReader)
+	closeErr := beforeReader.Close()
+	if err != nil || closeErr != nil || string(before) != "before" {
+		t.Fatalf("reader opened before replacement returned %q; errors=%v/%v", before, err, closeErr)
+	}
+
+	_, currentReader, err := objects.Open(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := objects.Delete(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	current, err := io.ReadAll(currentReader)
+	closeErr = currentReader.Close()
+	if err != nil || closeErr != nil || string(current) != "after replacement" {
+		t.Fatalf("reader opened before delete returned %q; errors=%v/%v", current, err, closeErr)
+	}
+}
+
+func TestFailedMetadataReplacementRetainsOldAndCompensatesNewBytes(t *testing.T) {
+	objects, metadata, _ := newTestService(t)
+	id := storage.ObjectID{Bucket: "bucket", Key: "failed-replace"}
+	if err := objects.Put(context.Background(), id, "text/plain", strings.NewReader("old")); err != nil {
+		t.Fatal(err)
+	}
+	old := metadata.get(id).StorageRef
+	metadata.updateErr = errors.New("injected metadata update failure")
+	if err := objects.Replace(context.Background(), id, "text/plain", strings.NewReader("new")); !errors.Is(err, metadata.updateErr) {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	if got := metadata.get(id).StorageRef; got != old {
+		t.Fatalf("failed update changed reference from %q to %q", old, got)
+	}
+	if _, err := objects.bytes.Stat(context.Background(), old); err != nil {
+		t.Fatalf("failed update removed valid old bytes: %v", err)
+	}
+	refs := objects.bytes.(*observedStore).references()
+	if len(refs) != 2 {
+		t.Fatalf("published references = %d, want old plus attempted replacement", len(refs))
+	}
+	for _, reference := range refs {
+		_, err := objects.bytes.Stat(context.Background(), reference)
+		if reference == old && err != nil {
+			t.Fatalf("old bytes missing: %v", err)
+		}
+		if reference != old && !errors.Is(err, storage.ErrContentNotFound) {
+			t.Fatalf("failed replacement bytes were not compensated: %v", err)
+		}
 	}
 }
 
@@ -240,6 +346,16 @@ func (m *metadataStub) Update(_ context.Context, id storage.ObjectID, metadata s
 	}
 	m.records[id] = metadata
 	return metadata, nil
+}
+
+func (m *metadataStub) Delete(_ context.Context, id storage.ObjectID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.records[id]; !ok {
+		return storage.ErrObjectNotFound
+	}
+	delete(m.records, id)
+	return nil
 }
 
 func (m *metadataStub) IsStorageRefReferenced(_ context.Context, reference string) (bool, error) {

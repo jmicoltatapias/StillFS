@@ -8,8 +8,8 @@ Estos puntos vienen de la solicitud de fase inicial y delimitan este incremento:
   logging estructurado, manejo explícito de errores y apagado ordenado.
 - PostgreSQL como base de datos de metadatos: configuración de conexión, pool,
   comprobación de salud y migraciones versionadas.
-- No establecer aún el esquema definitivo de objetos ni implementar operaciones
-  S3. No persistir bytes de objetos en PostgreSQL.
+- PostgreSQL persiste metadatos e identidad mínima; los bytes de objetos siguen
+  fuera de PostgreSQL.
 - Definir interfaces internas distintas para el almacenamiento de bytes de
   objetos y para la persistencia de metadatos, sin fingir implementaciones.
 - Frontend React con TypeScript, organización modular, navegación básica y una
@@ -27,8 +27,8 @@ Estos puntos vienen de la solicitud de fase inicial y delimitan este incremento:
 
 - Se conserva la compatibilidad con la versión Go declarada por el módulo hasta
   que una dependencia revisada requiera justificar un cambio.
-- PostgreSQL almacena metadatos e infraestructura de migración solamente; los
-  bytes de objetos quedan detrás de una interfaz de almacenamiento separada.
+- PostgreSQL almacena metadatos, principals y secretos de credenciales cifrados;
+  los bytes de objetos quedan detrás de una interfaz separada.
 - El esquema inicial incluye buckets y metadatos de objetos, con IDs internos
   `BIGINT IDENTITY`, unicidad de nombre y de `(bucket, key)`, referencia opaca
   de contenido externo, tamaño no negativo y `ETag` separado del checksum.
@@ -44,9 +44,17 @@ Estos puntos vienen de la solicitud de fase inicial y delimitan este incremento:
 - `GET /health/live` responde 200 mientras el proceso HTTP atiende; `GET
   /health/ready` responde 200 con `{"status":"ok","database":"ok"}` si la
   base responde, o 503 con `{"status":"not_ready","database":"unavailable"}`.
-- El servidor aplica las migraciones numeradas existentes al inicio, en
-  transacciones individuales, y registra su versión en
-  `stillfs_schema_migrations`; aún no existe migración de esquema de aplicación.
+- El servidor aplica migraciones numeradas al inicio en transacciones
+  individuales. `0001` crea buckets/objetos y `0002` añade principals,
+  credenciales cifradas y ownership nullable de buckets.
+- La tarea 004 añade un subconjunto path-style de S3 API v1, autenticado con
+  SigV4 de cabecera, scope de región `s3` y payload SHA-256 firmado. No se
+  declara compatibilidad general con S3.
+- Los buckets se asignan a principals. Los buckets anteriores a la migración
+  `0002` permanecen sin owner y no se exponen por S3 hasta una asignación
+  explícita.
+- La UI de estado vive bajo `/console/`; `/` queda reservado para listar
+  buckets autenticados.
 - La UI se sirve desde `web/dist` cuando existe el artefacto generado; Vite usa
   un proxy local hacia el backend durante desarrollo frontend.
 - El despliegue Compose es para desarrollo local, no una afirmación de
@@ -66,12 +74,16 @@ Estos puntos vienen de la solicitud de fase inicial y delimitan este incremento:
   iniciar.
 - Uso multiproceso de una raíz local, garantías específicas por filesystem y
   pruebas de caída abrupta.
-- Política de retención, identidad, autenticación, TLS y secretos fuera del
-  entorno de desarrollo.
+- IAM/policies completos, rotación de clave maestra, TLS integrado, controles
+  anti-replay adicionales y políticas de secretos fuera del entorno de
+  desarrollo.
+- Pruebas de interoperabilidad con AWS CLI y otros SDKs; la tarea 005 ejecutó
+  la suite documentada con AWS SDK for Go v2 `service/s3` v1.113.2, pero no
+  valida AWS CLI ni otras versiones/clientes.
 - Revisión legal completa de dependencias y distribución del texto legal de
   AGPL-3.0. Esta especificación no afirma que esa revisión haya ocurrido.
 
 ## Fuera de alcance
 
-Operaciones S3, autenticación de usuarios, administración, clustering,
-replicación y garantías de disponibilidad distribuida.
+Multipart, versionado S3, IAM completo, lifecycle, federación, administración
+web, clustering, replicación y garantías de disponibilidad distribuida.

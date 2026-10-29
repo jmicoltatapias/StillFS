@@ -10,9 +10,13 @@ import (
 	"syscall"
 
 	"github.com/jmicoltatapias/stillfs/internal/config"
+	"github.com/jmicoltatapias/stillfs/internal/credential"
 	"github.com/jmicoltatapias/stillfs/internal/httpapi"
 	"github.com/jmicoltatapias/stillfs/internal/logging"
+	"github.com/jmicoltatapias/stillfs/internal/objectservice"
 	"github.com/jmicoltatapias/stillfs/internal/postgres"
+	"github.com/jmicoltatapias/stillfs/internal/s3api"
+	"github.com/jmicoltatapias/stillfs/internal/sigv4"
 	"github.com/jmicoltatapias/stillfs/internal/storage/local"
 )
 
@@ -42,18 +46,26 @@ func runMain() int {
 		logger.Error("database migration failed", map[string]interface{}{"error": err.Error()})
 		return 1
 	}
-	if _, err := local.New(cfg.StorageRoot); err != nil {
+	objectStore, err := local.New(cfg.StorageRoot)
+	if err != nil {
 		logger.Error("object storage initialization failed", map[string]interface{}{"error": err.Error()})
 		return 1
 	}
-	if err := run(ctx, cfg, logger, postgres.Checker{DB: db}); err != nil {
+	metadataRepository := postgres.NewMetadataRepository(db)
+	credentialRepository := postgres.NewCredentialRepository(db)
+	objects := objectservice.New(objectStore, metadataRepository, logger)
+	api := s3api.New(sigv4.Authenticator{
+		Region: cfg.S3Region, MaxClockSkew: cfg.S3ClockSkew,
+		Resolver: credential.Resolver{Store: credentialRepository, Key: cfg.CredentialEncryptionKey},
+	}, postgres.NewBucketRepository(db), metadataRepository, objects, cfg.MaxObjectBytes, cfg.MaxMetadataBytes, logger)
+	if err := run(ctx, cfg, logger, postgres.Checker{DB: db}, api); err != nil {
 		logger.Error("server stopped with error", map[string]interface{}{"error": err.Error()})
 		return 1
 	}
 	return 0
 }
 
-func run(ctx context.Context, cfg config.Config, logger *logging.Logger, database httpapi.HealthChecker) error {
+func run(ctx context.Context, cfg config.Config, logger *logging.Logger, database httpapi.HealthChecker, s3Handler ...http.Handler) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -62,10 +74,10 @@ func run(ctx context.Context, cfg config.Config, logger *logging.Logger, databas
 		return err
 	}
 	server := &http.Server{
-		Addr:         cfg.HTTPAddr,
-		Handler:      httpapi.NewHandler(database),
-		ReadTimeout:  cfg.ReadTimeout,
-		WriteTimeout: cfg.WriteTimeout,
+		Addr:              cfg.HTTPAddr,
+		Handler:           httpapi.NewHandler(database, s3Handler...),
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 	}
 	serveErr := make(chan error, 1)
 	go func() {

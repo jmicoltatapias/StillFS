@@ -23,14 +23,14 @@ type BucketRepository struct{ db *sql.DB }
 func NewBucketRepository(db *sql.DB) *BucketRepository { return &BucketRepository{db: db} }
 
 // CreateBucket inserts a bucket. Duplicate names map to storage.ErrAlreadyExists.
-func (r *BucketRepository) CreateBucket(ctx context.Context, name string) (storage.Bucket, error) {
-	if name == "" {
+func (r *BucketRepository) CreateBucket(ctx context.Context, ownerID int64, name string) (storage.Bucket, error) {
+	if name == "" || ownerID <= 0 {
 		return storage.Bucket{}, storage.ErrInvalidBucketName
 	}
 	var bucket storage.Bucket
 	err := r.db.QueryRowContext(ctx, `
-		INSERT INTO buckets(name) VALUES ($1)
-		RETURNING id, name, created_at`, name).Scan(&bucket.ID, &bucket.Name, &bucket.CreatedAt)
+		INSERT INTO buckets(owner_id, name) VALUES ($1, $2)
+		RETURNING id, owner_id, name, created_at`, ownerID, name).Scan(&bucket.ID, &bucket.OwnerID, &bucket.Name, &bucket.CreatedAt)
 	if err != nil {
 		return storage.Bucket{}, mapDBError(err)
 	}
@@ -39,12 +39,12 @@ func (r *BucketRepository) CreateBucket(ctx context.Context, name string) (stora
 
 // GetBucket finds a bucket by stable internal ID.
 func (r *BucketRepository) GetBucket(ctx context.Context, id int64) (storage.Bucket, error) {
-	return scanBucket(r.db.QueryRowContext(ctx, `SELECT id, name, created_at FROM buckets WHERE id = $1`, id))
+	return scanBucket(r.db.QueryRowContext(ctx, `SELECT id, COALESCE(owner_id, 0), name, created_at FROM buckets WHERE id = $1`, id))
 }
 
 // GetBucketByName finds a bucket by its unique name.
 func (r *BucketRepository) GetBucketByName(ctx context.Context, name string) (storage.Bucket, error) {
-	return scanBucket(r.db.QueryRowContext(ctx, `SELECT id, name, created_at FROM buckets WHERE name = $1`, name))
+	return scanBucket(r.db.QueryRowContext(ctx, `SELECT id, COALESCE(owner_id, 0), name, created_at FROM buckets WHERE name = $1`, name))
 }
 
 // ListBuckets returns a keyset-paginated page ordered by C-collated name.
@@ -54,10 +54,10 @@ func (r *BucketRepository) ListBuckets(ctx context.Context, request storage.Buck
 		return storage.BucketPage{}, err
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, created_at FROM buckets
-		WHERE name > $1
+		SELECT id, owner_id, name, created_at FROM buckets
+		WHERE owner_id = $1 AND name > $2
 		ORDER BY name
-		LIMIT $2`, request.After, limit+1)
+		LIMIT $3`, request.OwnerID, request.After, limit+1)
 	if err != nil {
 		return storage.BucketPage{}, mapDBError(err)
 	}
@@ -66,7 +66,7 @@ func (r *BucketRepository) ListBuckets(ctx context.Context, request storage.Buck
 	page := storage.BucketPage{Items: make([]storage.Bucket, 0, limit)}
 	for rows.Next() {
 		var bucket storage.Bucket
-		if err := rows.Scan(&bucket.ID, &bucket.Name, &bucket.CreatedAt); err != nil {
+		if err := rows.Scan(&bucket.ID, &bucket.OwnerID, &bucket.Name, &bucket.CreatedAt); err != nil {
 			return storage.BucketPage{}, mapDBError(err)
 		}
 		page.Items = append(page.Items, bucket)
@@ -83,14 +83,14 @@ func (r *BucketRepository) ListBuckets(ctx context.Context, request storage.Buck
 
 // DeleteBucket removes an empty bucket only. The row lock and FK provide
 // serialization against object registration; no object bytes are touched.
-func (r *BucketRepository) DeleteBucket(ctx context.Context, name string) error {
+func (r *BucketRepository) DeleteBucket(ctx context.Context, ownerID int64, name string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return mapDBError(err)
 	}
 	defer tx.Rollback()
 	var id int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM buckets WHERE name = $1 FOR UPDATE`, name).Scan(&id); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM buckets WHERE name = $1 AND owner_id = $2 FOR UPDATE`, name, ownerID).Scan(&id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return storage.ErrBucketNotFound
 		}
@@ -262,6 +262,59 @@ func (r *MetadataRepository) IsStorageRefReferenced(ctx context.Context, referen
 	return exists, nil
 }
 
+// ListStorageReferences returns distinct published references in C-collated
+// key order. It is intended for read-only consistency diagnostics; callers
+// must not infer that an unreferenced result is safe to delete during writes.
+func (r *MetadataRepository) ListStorageReferences(ctx context.Context, after string, requestedLimit int) ([]string, string, error) {
+	limit, err := pageLimit(requestedLimit)
+	if err != nil {
+		return nil, "", err
+	}
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, "", mapDBError(err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
+		SELECT storage_ref FROM (
+			SELECT DISTINCT storage_ref COLLATE "C" AS storage_ref
+			FROM objects
+			WHERE storage_ref COLLATE "C" > $1
+		) refs
+		ORDER BY storage_ref COLLATE "C"
+		LIMIT $2`, after, limit+1)
+	if err != nil {
+		return nil, "", mapDBError(err)
+	}
+	defer rows.Close()
+	references := make([]string, 0, limit)
+	for rows.Next() {
+		var reference string
+		if err := rows.Scan(&reference); err != nil {
+			return nil, "", mapDBError(err)
+		}
+		references = append(references, reference)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", mapDBError(err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, "", mapDBError(err)
+	}
+	if len(references) <= limit {
+		if err := tx.Commit(); err != nil {
+			return nil, "", mapDBError(err)
+		}
+		return references, "", nil
+	}
+	references = references[:limit]
+	next := references[len(references)-1]
+	if err := tx.Commit(); err != nil {
+		return nil, "", mapDBError(err)
+	}
+	return references, next, nil
+}
+
 const objectColumns = `
 	SELECT o.id, b.name, o.object_key, o.storage_ref, o.size_bytes,
 	       COALESCE(o.content_type, ''), COALESCE(o.etag, ''),
@@ -275,7 +328,7 @@ type rowScanner interface{ Scan(...interface{}) error }
 
 func scanBucket(row rowScanner) (storage.Bucket, error) {
 	var bucket storage.Bucket
-	if err := row.Scan(&bucket.ID, &bucket.Name, &bucket.CreatedAt); err != nil {
+	if err := row.Scan(&bucket.ID, &bucket.OwnerID, &bucket.Name, &bucket.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return storage.Bucket{}, storage.ErrBucketNotFound
 		}

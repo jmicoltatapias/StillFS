@@ -25,7 +25,9 @@ func TestRunGracefulShutdown(t *testing.T) {
 	_ = probe.Close()
 
 	cfg := config.Config{
-		HTTPAddr: address, StorageRoot: t.TempDir(), ReadTimeout: time.Second, WriteTimeout: time.Second, ShutdownTimeout: time.Second,
+		HTTPAddr: address, StorageRoot: t.TempDir(), ReadHeaderTimeout: time.Second, ShutdownTimeout: time.Second,
+		CredentialEncryptionKey: bytes.Repeat([]byte{1}, 32), S3Region: "us-east-1", S3ClockSkew: time.Minute,
+		MaxObjectBytes: 1024, MaxHeaderBytes: 1 << 20, MaxMetadataBytes: 8 << 10,
 		Database: config.DatabaseConfig{
 			Host: "localhost", Port: 5432, Name: "stillfs", User: "stillfs", SSLMode: "disable",
 			MaxOpenConns: 1, MaxIdleConns: 1, ConnMaxLifetime: time.Minute, ConnectTimeout: time.Second,

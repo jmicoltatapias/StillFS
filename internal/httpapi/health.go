@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -20,7 +21,7 @@ type healthResponse struct {
 }
 
 // NewHandler registers liveness and readiness checks; unknown routes remain 404.
-func NewHandler(database HealthChecker) http.Handler {
+func NewHandler(database HealthChecker, s3Handler ...http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health/live", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -44,10 +45,36 @@ func NewHandler(database HealthChecker) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Database: "ok"})
 	})
+	var console http.Handler
 	if _, err := os.Stat("web/dist"); err == nil {
-		mux.Handle("/", http.FileServer(http.Dir("web/dist")))
+		console = http.StripPrefix("/console/", http.FileServer(http.Dir("web/dist")))
 	}
-	return mux
+	var api http.Handler
+	if len(s3Handler) > 0 {
+		api = s3Handler[0]
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health/live", "/health/ready":
+			mux.ServeHTTP(w, r)
+		case "/console":
+			if console == nil {
+				http.NotFound(w, r)
+				return
+			}
+			http.Redirect(w, r, "/console/", http.StatusTemporaryRedirect)
+		default:
+			if console != nil && strings.HasPrefix(r.URL.Path, "/console/") {
+				console.ServeHTTP(w, r)
+				return
+			}
+			if api != nil {
+				api.ServeHTTP(w, r)
+				return
+			}
+			http.NotFound(w, r)
+		}
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body healthResponse) {

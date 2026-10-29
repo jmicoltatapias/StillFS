@@ -9,15 +9,17 @@ import (
 )
 
 var (
-	ErrBucketNotFound    = errors.New("bucket not found")
-	ErrInvalidBucketName = errors.New("invalid bucket name")
-	ErrObjectNotFound    = errors.New("object metadata not found")
-	ErrContentNotFound   = errors.New("object content not found")
-	ErrAlreadyExists     = errors.New("metadata record already exists")
-	ErrBucketNotEmpty    = errors.New("bucket is not empty")
-	ErrConflict          = errors.New("metadata integrity conflict")
-	ErrInvalidMetadata   = errors.New("invalid object metadata")
-	ErrInvalidPageLimit  = errors.New("invalid page limit")
+	ErrBucketNotFound     = errors.New("bucket not found")
+	ErrInvalidBucketName  = errors.New("invalid bucket name")
+	ErrObjectNotFound     = errors.New("object metadata not found")
+	ErrContentNotFound    = errors.New("object content not found")
+	ErrAlreadyExists      = errors.New("metadata record already exists")
+	ErrBucketNotEmpty     = errors.New("bucket is not empty")
+	ErrConflict           = errors.New("metadata integrity conflict")
+	ErrInvalidMetadata    = errors.New("invalid object metadata")
+	ErrInvalidPageLimit   = errors.New("invalid page limit")
+	ErrCredentialNotFound = errors.New("credential not found")
+	ErrInvalidCredential  = errors.New("invalid credential")
 )
 
 // ObjectID identifies an object by bucket and key.
@@ -67,14 +69,16 @@ type ObjectMetadata struct {
 // Bucket is metadata about one logical namespace for objects.
 type Bucket struct {
 	ID        int64
+	OwnerID   int64
 	Name      string
 	CreatedAt time.Time
 }
 
 // BucketPageRequest uses the last bucket name as a keyset cursor.
 type BucketPageRequest struct {
-	After string
-	Limit int
+	OwnerID int64
+	After   string
+	Limit   int
 }
 
 // BucketPage is ordered by bucket name. NextAfter is empty on the last page.
@@ -99,11 +103,30 @@ type ObjectPage struct {
 
 // BucketStore persists bucket metadata.
 type BucketStore interface {
-	CreateBucket(ctx context.Context, name string) (Bucket, error)
+	CreateBucket(ctx context.Context, ownerID int64, name string) (Bucket, error)
 	GetBucket(ctx context.Context, id int64) (Bucket, error)
 	GetBucketByName(ctx context.Context, name string) (Bucket, error)
 	ListBuckets(ctx context.Context, request BucketPageRequest) (BucketPage, error)
-	DeleteBucket(ctx context.Context, name string) error
+	DeleteBucket(ctx context.Context, ownerID int64, name string) error
+}
+
+// Credential contains encrypted secret material; plaintext secrets must never
+// be returned by repository methods.
+type Credential struct {
+	AccessKeyID     string
+	PrincipalID     int64
+	EncryptedSecret []byte
+	Nonce           []byte
+	RevokedAt       *time.Time
+	CreatedAt       time.Time
+}
+
+// CredentialStore manages the minimal identity and key records used for S3
+// request authentication. It is not a complete IAM policy store.
+type CredentialStore interface {
+	CreateCredential(ctx context.Context, credential Credential) (Credential, error)
+	GetCredential(ctx context.Context, accessKeyID string) (Credential, error)
+	RevokeCredential(ctx context.Context, accessKeyID string) error
 }
 
 // MetadataStore persists object metadata, never object bytes. Put is

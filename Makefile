@@ -1,7 +1,9 @@
-.PHONY: build run fmt vet test test-integration check frontend-install frontend-check frontend-build
+.PHONY: build run fmt vet test test-integration test-s3-compat check frontend-install frontend-check frontend-build
 
 build:
+	mkdir -p bin
 	go build -o bin/stillfs ./cmd/stillfs
+	go build -o bin/stillfsctl ./cmd/stillfsctl
 
 run:
 	go run ./cmd/stillfs
@@ -17,7 +19,11 @@ test:
 
 test-integration:
 	@test -n "$$STILLFS_TEST_DATABASE_URL" || (echo "STILLFS_TEST_DATABASE_URL must point to a disposable PostgreSQL database" >&2; exit 1)
-	go test -count=1 -v ./internal/postgres -run '^Test(PostgresMetadataRepositories|ObjectServiceWithPostgresAndLocalStore)$$'
+	go test -count=1 -v ./internal/postgres -run '^Test(PostgresMetadataRepositories|ObjectServiceWithPostgresAndLocalStore|S3APIWithPostgresAndLocalStore|IdentityMigrationPreservesLegacyBuckets|StorageReferenceListingIsDistinctAndKeysetPaginated)$$'
+
+test-s3-compat:
+	@test -n "$$STILLFS_TEST_DATABASE_URL" || (echo "STILLFS_TEST_DATABASE_URL must point to a disposable PostgreSQL database" >&2; exit 1)
+	cd tests/s3compat && go test -count=1 -v ./...
 
 frontend-install:
 	cd web && npm ci

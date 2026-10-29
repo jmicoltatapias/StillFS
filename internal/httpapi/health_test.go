@@ -35,3 +35,15 @@ func TestUnknownRouteIsNotImplemented(t *testing.T) {
 		t.Fatalf("status = %d, want 404", recorder.Code)
 	}
 }
+
+func TestS3PathIsForwardedWithoutServeMuxNormalization(t *testing.T) {
+	seen := ""
+	handler := NewHandler(healthStub{}, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		seen = r.URL.Path
+	}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/bucket/a//b", nil))
+	if recorder.Code != http.StatusOK || seen != "/bucket/a//b" {
+		t.Fatalf("S3 path forwarding: status=%d path=%q", recorder.Code, seen)
+	}
+}

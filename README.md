@@ -2,8 +2,8 @@
 
 StillFS is an object-storage server under development. It has a Go HTTP
 process, PostgreSQL metadata persistence and migrations, a local streaming
-object-byte backend, and a small React status UI. S3 operations are not
-implemented.
+object-byte backend, a limited path-style S3 API v1, and a small React status
+UI. This is not general S3 compatibility.
 
 ## Requirements
 
@@ -19,17 +19,24 @@ see [license notes](docs/licensing.md).
 
 ## Local setup
 
-1. Copy `.env.example` to `.env` and change the development database password
-   before using a shared machine.
+1. Copy `.env.example` to `.env`, set a persistent credential-encryption key,
+   and change the development database password before using a shared machine.
+   Generate a key without printing it to the terminal with
+   `umask 077; printf 'STILLFS_CREDENTIAL_ENCRYPTION_KEY=%s\n' "$(openssl rand -base64 32)" >> .env; chmod 600 .env`.
 2. Start PostgreSQL and StillFS with `docker compose up --build`.
-3. Open `http://localhost:9000`. The status page checks `/health/ready`, which
+3. Open `http://localhost:9000/console/`. The status page checks
+   `/health/ready`, which
    reports whether StillFS can reach PostgreSQL. `/health/live` checks only
    that the HTTP process is responding.
+4. Create the first S3 credential locally with
+   `docker compose exec stillfs /app/stillfsctl credential create`. Save the
+   secret shown once. There is no default access key or HTTP credential API.
 
 For frontend-only development, run `cd web && npm ci && npm run dev`; Vite
 proxies health requests to `localhost:9000`. Run the backend separately with
-`go run ./cmd/stillfs` after starting a PostgreSQL instance and setting the
-database environment variables below.
+`go run ./cmd/stillfs` after starting PostgreSQL and setting the database and
+credential encryption key environment variables below. The frontend is at
+`/console/`; `/` is reserved for the authenticated S3 service listing.
 
 ## Configuration
 
@@ -46,18 +53,55 @@ database environment variables below.
 | `STILLFS_DB_SSLROOTCERT` | driver default | PostgreSQL CA certificate file |
 | `STILLFS_DB_MAX_OPEN_CONNS` | `10` | Maximum open pool connections |
 | `STILLFS_DB_MAX_IDLE_CONNS` | `5` | Maximum idle pool connections |
+| `STILLFS_CREDENTIAL_ENCRYPTION_KEY` | required | Base64 encoding of exactly 32 random bytes; encrypts credential secrets at rest |
+| `STILLFS_S3_REGION` | `us-east-1` | Only accepted SigV4 region |
+| `STILLFS_S3_CLOCK_SKEW` | `5m` | Maximum absolute request timestamp difference |
+| `STILLFS_MAX_OBJECT_BYTES` | `5368709120` | Maximum single PUT size in bytes |
+| `STILLFS_MAX_HEADER_BYTES` | `1048576` | HTTP request header limit |
+| `STILLFS_MAX_METADATA_BYTES` | `8192` | Maximum supported object/list metadata bytes |
 
-HTTP read/write timeouts, shutdown timeout, connection lifetime, and connect
-timeout have validated code defaults. Development Compose explicitly disables
+The HTTP server applies a 15 second header-read timeout and the configured
+header-size limit. It has no whole-request or response timeout because object
+transfers stream; body size is bounded, but slow-body idle timeouts still need
+an operational policy. Shutdown timeout, database pool lifetime, and connect
+timeout have validated defaults. Development Compose explicitly disables
 PostgreSQL TLS on its private local network. The standalone backend default
-verifies the PostgreSQL server certificate and hostname. Configure secrets
-appropriately for other environments.
+verifies the PostgreSQL server certificate and hostname. Put the S3 API behind
+TLS in deployments; this server does not terminate TLS itself.
 
 The local object store creates its root and shard directories with mode `0700`
 and files with mode `0600`. Keep the root on a persistent filesystem. Compose
 mounts the named `stillfs-objects` volume at `/app/data/objects`; deleting the
 volume destroys all local object bytes. Do not share one storage root between
 multiple StillFS processes. See [local storage guarantees and recovery limits](docs/architecture/local-storage.md).
+
+## S3 API and credentials
+
+The implemented path-style subset, SigV4 mode, errors, limits, and known
+compatibility gaps are listed in [docs/api/s3-v1.md](docs/api/s3-v1.md).
+Credential secrets are encrypted using AES-256-GCM under
+`STILLFS_CREDENTIAL_ENCRYPTION_KEY`; back up this key and keep it stable or
+existing credentials cannot be decrypted. Create another key for an existing
+principal with `stillfsctl credential create --principal-id ID`; revoke a key
+with `stillfsctl credential revoke ACCESS_KEY_ID`. Revocation disables that
+key but leaves its principal and buckets intact.
+
+The first credential command creates the principal. Use the generated Access
+Key ID and secret with a path-style SigV4 client in region `us-east-1`. The AWS
+CLI example has not been run in this environment; configure the CLI for
+path-style requests and signed payloads before use:
+
+```ini
+[default]
+s3 =
+    addressing_style = path
+    payload_signing_enabled = true
+```
+
+```sh
+AWS_ACCESS_KEY_ID='the-access-key-id' AWS_SECRET_ACCESS_KEY='the-secret' \
+  aws --endpoint-url http://localhost:9000 --region us-east-1 s3api create-bucket --bucket stillfs-example
+```
 
 ## Build and tests
 
@@ -68,6 +112,10 @@ make frontend-install
 make check
 make build
 ```
+
+`make build` builds both `stillfs` and the local-only `stillfsctl` credential
+tool. The frontend status page remains observational; it does not administer
+buckets or credentials.
 
 `go test ./...` runs unit tests and runs the PostgreSQL integration test when
 `STILLFS_TEST_DATABASE_URL` is set. Run it explicitly with:
@@ -80,8 +128,8 @@ The tests require a disposable database role that can create and drop schemas.
 They use isolated temporary schemas and remove them at the end. Coverage
 includes migration from an empty schema, repeated/concurrent migration
 behavior, transaction rollback, repositories, constraints, pagination, races,
-and coordination of local bytes with PostgreSQL metadata. CI runs these tests
-against a temporary PostgreSQL service.
+coordination of local bytes with PostgreSQL metadata, and signed S3 operations.
+CI runs these tests against a temporary PostgreSQL service.
 
 ## Migrations
 

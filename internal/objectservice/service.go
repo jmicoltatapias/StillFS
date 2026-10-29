@@ -3,8 +3,11 @@ package objectservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/jmicoltatapias/stillfs/internal/storage"
@@ -23,6 +26,7 @@ type Service struct {
 	bytes    storage.ObjectStore
 	metadata storage.MetadataStore
 	logger   ErrorLogger
+	locks    [128]sync.Mutex
 }
 
 // New creates a coordinator over the existing storage interfaces.
@@ -34,6 +38,29 @@ func New(bytes storage.ObjectStore, metadata storage.MetadataStore, logger Error
 // overwrite an existing object. A newly published blob is compensated when
 // PostgreSQL confirms that no row references it.
 func (s *Service) Put(ctx context.Context, id storage.ObjectID, contentType string, content io.Reader) error {
+	lock := s.objectLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.putLocked(ctx, id, contentType, content)
+}
+
+// PutOrReplace serializes create/replace decisions for a key within this
+// process. Local storage roots are not supported across multiple processes.
+func (s *Service) PutOrReplace(ctx context.Context, id storage.ObjectID, contentType string, content io.Reader) error {
+	lock := s.objectLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	_, err := s.metadata.Get(ctx, id)
+	if err == nil {
+		return s.replaceLocked(ctx, id, contentType, content)
+	}
+	if !errors.Is(err, storage.ErrObjectNotFound) {
+		return fmt.Errorf("find object metadata before create or replace: %w", err)
+	}
+	return s.putLocked(ctx, id, contentType, content)
+}
+
+func (s *Service) putLocked(ctx context.Context, id storage.ObjectID, contentType string, content io.Reader) error {
 	info, err := s.bytes.Put(ctx, content)
 	if err != nil {
 		if info.Reference != "" {
@@ -55,6 +82,13 @@ func (s *Service) Put(ctx context.Context, id storage.ObjectID, contentType stri
 // After a successful update the previous blob is deliberately retained; a
 // future reconciler must prove it is unreferenced before deleting it.
 func (s *Service) Replace(ctx context.Context, id storage.ObjectID, contentType string, content io.Reader) error {
+	lock := s.objectLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.replaceLocked(ctx, id, contentType, content)
+}
+
+func (s *Service) replaceLocked(ctx context.Context, id storage.ObjectID, contentType string, content io.Reader) error {
 	if _, err := s.metadata.Get(ctx, id); err != nil {
 		return fmt.Errorf("find object metadata before replacement: %w", err)
 	}
@@ -77,6 +111,9 @@ func (s *Service) Replace(ctx context.Context, id storage.ObjectID, contentType 
 // Open resolves metadata first and streams the referenced content. It never
 // buffers the complete object in memory.
 func (s *Service) Open(ctx context.Context, id storage.ObjectID) (storage.ObjectMetadata, io.ReadCloser, error) {
+	lock := s.objectLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	metadata, err := s.metadata.Get(ctx, id)
 	if err != nil {
 		return storage.ObjectMetadata{}, nil, err
@@ -90,6 +127,49 @@ func (s *Service) Open(ctx context.Context, id storage.ObjectID) (storage.Object
 		return storage.ObjectMetadata{}, nil, fmt.Errorf("open referenced object content: %w", err)
 	}
 	return metadata, reader, nil
+}
+
+// Delete removes metadata first, then deletes the content only after a
+// successful reference check. If the reference check is unavailable the
+// bytes remain and the caller receives an error for operational diagnosis.
+func (s *Service) Delete(ctx context.Context, id storage.ObjectID) error {
+	lock := s.objectLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	metadata, err := s.metadata.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.metadata.Delete(ctx, id); err != nil {
+		return fmt.Errorf("delete object metadata: %w", err)
+	}
+	referenced, err := s.metadata.IsStorageRefReferenced(ctx, metadata.StorageRef)
+	if err != nil {
+		s.logger.Error("deleted object metadata but retained content because reference state is unknown", map[string]interface{}{
+			"storage_ref": metadata.StorageRef,
+			"error":       err.Error(),
+		})
+		return fmt.Errorf("object metadata deleted; could not safely remove object content: %w", err)
+	}
+	if referenced {
+		return nil
+	}
+	if err := s.bytes.Delete(ctx, metadata.StorageRef); err != nil {
+		s.logger.Error("deleted object metadata but object content cleanup failed", map[string]interface{}{
+			"storage_ref": metadata.StorageRef,
+			"error":       err.Error(),
+		})
+		return fmt.Errorf("object metadata deleted; remove object content: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) objectLock(id storage.ObjectID) *sync.Mutex {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(id.Bucket))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write([]byte(id.Key))
+	return &s.locks[hasher.Sum32()%uint32(len(s.locks))]
 }
 
 func (s *Service) compensate(reference, operation string, cause error) error {
@@ -129,10 +209,15 @@ func (s *Service) compensate(reference, operation string, cause error) error {
 }
 
 func metadataFromInfo(info storage.ObjectInfo, contentType string) storage.ObjectMetadata {
+	etag := ""
+	if info.ChecksumAlgorithm == "sha256" && info.Checksum != "" {
+		etag = `"sha256-` + info.Checksum + `"`
+	}
 	return storage.ObjectMetadata{
 		StorageRef:        info.Reference,
 		ContentLength:     info.Size,
 		ContentType:       contentType,
+		ETag:              etag,
 		ChecksumAlgorithm: info.ChecksumAlgorithm,
 		Checksum:          info.Checksum,
 	}

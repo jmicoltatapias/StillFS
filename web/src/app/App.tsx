@@ -26,7 +26,7 @@ export function App() {
       </aside>
 
       <main className="main">
-        <header className="topbar"><span>StillFS / {page === 'home' ? 'Inicio' : 'Sistema'}</span><span className="phase">Fase inicial</span></header>
+        <header className="topbar"><span>StillFS / {page === 'home' ? 'Inicio' : 'Sistema'}</span><span className="phase">API S3 v1</span></header>
         <div className="content">
           {page === 'home' ? <Home onOpenStatus={() => setPage('system')} /> : <SystemStatus />}
         </div>
@@ -40,11 +40,11 @@ function Home({ onOpenStatus }: { onOpenStatus: () => void }) {
     <>
       <p className="eyebrow">ALMACENAMIENTO DE OBJETOS</p>
       <h1>Bienvenido a StillFS</h1>
-      <p className="intro">La infraestructura inicial está lista para configurarse. Consulta el estado del servicio y de la base de datos.</p>
+      <p className="intro">Consulta el estado real del servicio y de PostgreSQL. La API de objetos se opera con clientes S3 compatibles.</p>
       <button className="primary" onClick={onOpenStatus}>Ver estado del sistema <span aria-hidden="true">→</span></button>
       <section className="note-card">
         <span className="note-icon" aria-hidden="true">i</span>
-        <div><h2>Fase de infraestructura</h2><p>Las operaciones S3 y el almacenamiento de objetos aún no están habilitados.</p></div>
+        <div><h2>Consola de estado</h2><p>Esta pantalla no administra buckets ni credenciales.</p></div>
       </section>
     </>
   )

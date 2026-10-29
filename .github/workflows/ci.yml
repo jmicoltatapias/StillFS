@@ -32,7 +32,10 @@ jobs:
       - run: test -z "$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"
       - run: go vet ./...
       - run: go test ./...
+      - run: go test -count=1 ./...
+        working-directory: tests/s3compat
       - run: go build -o /tmp/stillfs-server ./cmd/stillfs
+      - run: go build -o /tmp/stillfsctl ./cmd/stillfsctl
 
   frontend:
     runs-on: ubuntu-latest

@@ -1,17 +1,20 @@
 package config
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
 
 func validConfig() Config {
 	return Config{
-		HTTPAddr:        ":9000",
-		StorageRoot:     "./data/objects",
-		ReadTimeout:     time.Second,
-		WriteTimeout:    time.Second,
-		ShutdownTimeout: time.Second,
+		HTTPAddr:                ":9000",
+		StorageRoot:             "./data/objects",
+		ReadHeaderTimeout:       time.Second,
+		ShutdownTimeout:         time.Second,
+		CredentialEncryptionKey: bytes.Repeat([]byte{1}, 32),
+		S3Region:                "us-east-1", S3ClockSkew: time.Minute,
+		MaxObjectBytes: 1024, MaxHeaderBytes: 1 << 20, MaxMetadataBytes: 8 << 10,
 		Database: DatabaseConfig{
 			Host: "localhost", Port: 5432, Name: "stillfs", User: "stillfs",
 			SSLMode: "disable", MaxOpenConns: 10, MaxIdleConns: 5,
@@ -28,7 +31,7 @@ func TestValidate(t *testing.T) {
 	}{
 		{"valid", validConfig(), false},
 		{"invalid address", func() Config { c := validConfig(); c.HTTPAddr = "no-port"; return c }(), true},
-		{"non-positive timeout", func() Config { c := validConfig(); c.ReadTimeout = 0; return c }(), true},
+		{"non-positive timeout", func() Config { c := validConfig(); c.ReadHeaderTimeout = 0; return c }(), true},
 		{"invalid database pool", func() Config { c := validConfig(); c.Database.MaxIdleConns = 11; return c }(), true},
 	}
 	for _, tt := range tests {
@@ -42,6 +45,7 @@ func TestValidate(t *testing.T) {
 }
 
 func TestLoadReadsDatabaseEnvironment(t *testing.T) {
+	t.Setenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	t.Setenv("STILLFS_HTTP_ADDR", "127.0.0.1:9001")
 	t.Setenv("STILLFS_DB_HOST", "db.internal")
 	t.Setenv("STILLFS_DB_PORT", "6432")
@@ -59,11 +63,21 @@ func TestLoadReadsDatabaseEnvironment(t *testing.T) {
 	if cfg.StorageRoot != "./data/objects" {
 		t.Fatalf("default storage root = %q", cfg.StorageRoot)
 	}
+	if cfg.S3Region != "us-east-1" || len(cfg.CredentialEncryptionKey) != 32 {
+		t.Fatalf("S3 configuration not loaded: region=%q encryption key length=%d", cfg.S3Region, len(cfg.CredentialEncryptionKey))
+	}
 }
 
 func TestLoadRejectsInvalidDatabasePort(t *testing.T) {
 	t.Setenv("STILLFS_DB_PORT", "not-a-number")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() succeeded with an invalid database port")
+	}
+}
+
+func TestLoadRequiresCredentialEncryptionKey(t *testing.T) {
+	t.Setenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() succeeded without the credential encryption key")
 	}
 }
