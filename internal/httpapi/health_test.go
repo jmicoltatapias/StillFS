@@ -29,10 +29,12 @@ func TestReadinessReportsDatabaseState(t *testing.T) {
 }
 
 func TestUnknownRouteIsNotImplemented(t *testing.T) {
-	recorder := httptest.NewRecorder()
-	NewHandler(healthStub{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin", nil))
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", recorder.Code)
+	for _, path := range []string{"/admin", "/admin/credentials", "/admin/audit"} {
+		recorder := httptest.NewRecorder()
+		NewHandler(healthStub{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, recorder.Code)
+		}
 	}
 }
 

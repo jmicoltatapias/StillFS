@@ -390,6 +390,9 @@ func prefixPattern(prefix string) string {
 }
 
 func mapDBError(err error) error {
+	if err == nil {
+		return nil
+	}
 	var pgErr *pq.Error
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {

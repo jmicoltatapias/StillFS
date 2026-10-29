@@ -9,17 +9,19 @@ import (
 )
 
 var (
-	ErrBucketNotFound     = errors.New("bucket not found")
-	ErrInvalidBucketName  = errors.New("invalid bucket name")
-	ErrObjectNotFound     = errors.New("object metadata not found")
-	ErrContentNotFound    = errors.New("object content not found")
-	ErrAlreadyExists      = errors.New("metadata record already exists")
-	ErrBucketNotEmpty     = errors.New("bucket is not empty")
-	ErrConflict           = errors.New("metadata integrity conflict")
-	ErrInvalidMetadata    = errors.New("invalid object metadata")
-	ErrInvalidPageLimit   = errors.New("invalid page limit")
-	ErrCredentialNotFound = errors.New("credential not found")
-	ErrInvalidCredential  = errors.New("invalid credential")
+	ErrBucketNotFound        = errors.New("bucket not found")
+	ErrInvalidBucketName     = errors.New("invalid bucket name")
+	ErrObjectNotFound        = errors.New("object metadata not found")
+	ErrContentNotFound       = errors.New("object content not found")
+	ErrAlreadyExists         = errors.New("metadata record already exists")
+	ErrBucketNotEmpty        = errors.New("bucket is not empty")
+	ErrConflict              = errors.New("metadata integrity conflict")
+	ErrInvalidMetadata       = errors.New("invalid object metadata")
+	ErrInvalidPageLimit      = errors.New("invalid page limit")
+	ErrCredentialNotFound    = errors.New("credential not found")
+	ErrInvalidCredential     = errors.New("invalid credential")
+	ErrRotationCommitUnknown = errors.New("credential key rotation commit outcome is unknown")
+	ErrMasterKeyMismatch     = errors.New("master key does not match the active credential key")
 )
 
 // ObjectID identifies an object by bucket and key.
@@ -117,8 +119,11 @@ type Credential struct {
 	PrincipalID     int64
 	EncryptedSecret []byte
 	Nonce           []byte
-	RevokedAt       *time.Time
-	CreatedAt       time.Time
+	// MasterKeyCheck is the database's verifier for the key used to encrypt
+	// this record. It is not a key or a per-credential secret.
+	MasterKeyCheck []byte
+	RevokedAt      *time.Time
+	CreatedAt      time.Time
 }
 
 // CredentialStore manages the minimal identity and key records used for S3
@@ -127,6 +132,40 @@ type CredentialStore interface {
 	CreateCredential(ctx context.Context, credential Credential) (Credential, error)
 	GetCredential(ctx context.Context, accessKeyID string) (Credential, error)
 	RevokeCredential(ctx context.Context, accessKeyID string) error
+}
+
+// CredentialSecretRotator re-encrypts every stored secret in one transaction.
+type CredentialSecretRotator interface {
+	RotateCredentialSecrets(ctx context.Context, oldKeyCheck, newKeyCheck []byte, transform func(accessKeyID string, ciphertext, nonce []byte) ([]byte, []byte, error)) (int, error)
+}
+
+// CredentialSecretVerifier checks the active verifier and every encrypted
+// credential while excluding concurrent credential-management writes.
+type CredentialSecretVerifier interface {
+	VerifyCredentialSecrets(ctx context.Context, keyCheck []byte, verify func(accessKeyID string, ciphertext, nonce []byte) error) (int, error)
+}
+
+// AuthorizationStore stores fixed StillFS permissions on individual keys.
+// It is intentionally not an AWS IAM policy interface.
+type AuthorizationStore interface {
+	HasCredentialPermission(ctx context.Context, accessKeyID string, principalID int64, permission string) (bool, error)
+	SetCredentialPermissions(ctx context.Context, accessKeyID string, permissions []string) error
+}
+
+// AuditEvent contains non-secret facts about a sensitive local operation.
+type AuditEvent struct {
+	ID         int64     `json:"id"`
+	Actor      string    `json:"actor"`
+	Action     string    `json:"action"`
+	Target     string    `json:"target"`
+	OccurredAt time.Time `json:"occurred_at"`
+}
+
+// AuditStore reads append-only application audit events. Database operators
+// can still alter these rows; this is not tamper-proof logging.
+type AuditStore interface {
+	ListAuditEvents(ctx context.Context, after int64, limit int) ([]AuditEvent, error)
+	AppendAuditEvent(ctx context.Context, action, target string) error
 }
 
 // MetadataStore persists object metadata, never object bytes. Put is

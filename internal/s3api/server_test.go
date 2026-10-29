@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jmicoltatapias/stillfs/internal/authorization"
 	"github.com/jmicoltatapias/stillfs/internal/logging"
 	"github.com/jmicoltatapias/stillfs/internal/objectservice"
 	"github.com/jmicoltatapias/stillfs/internal/sigv4"
@@ -177,6 +178,19 @@ func TestS3AuthenticationErrorsAndOwnershipIsolation(t *testing.T) {
 	}
 }
 
+func TestValidCredentialWithoutPermissionIsDeniedBeforeResourceLookup(t *testing.T) {
+	server, _ := newTestServer(t)
+	server.authorizer = denyAuthorizer{}
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, signedRequest(t, http.MethodGet, "http://stillfs.test/not-owned/object", nil, nil))
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "<Code>AccessDenied</Code>") {
+		t.Fatalf("denied request = %d %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "NoSuchBucket") {
+		t.Fatal("authorization failure disclosed bucket existence")
+	}
+}
+
 func TestS3RejectsInvalidBucketAndPayloadMismatchWithoutPublishing(t *testing.T) {
 	server, data := newTestServer(t)
 	badBucket := httptest.NewRecorder()
@@ -283,8 +297,18 @@ func newTestServer(t *testing.T) (*Server, *memoryStore) {
 	objects := objectservice.New(store, data, logger)
 	server := New(sigv4.Authenticator{
 		Region: "us-east-1", MaxClockSkew: 5 * time.Minute, Resolver: apiResolver{},
-	}, data, data, objects, 8<<20, 8<<10, logger)
+	}, data, data, objects, 8<<20, 8<<10, logger, allowAllAuthorizer{})
 	return server, data
+}
+
+type allowAllAuthorizer struct{}
+
+func (allowAllAuthorizer) Authorize(context.Context, sigv4.Authenticated, string) error { return nil }
+
+type denyAuthorizer struct{}
+
+func (denyAuthorizer) Authorize(context.Context, sigv4.Authenticated, string) error {
+	return authorization.ErrDenied
 }
 
 type apiResolver struct{}

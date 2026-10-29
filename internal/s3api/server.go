@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jmicoltatapias/stillfs/internal/authorization"
 	"github.com/jmicoltatapias/stillfs/internal/objectservice"
 	"github.com/jmicoltatapias/stillfs/internal/sigv4"
 	"github.com/jmicoltatapias/stillfs/internal/storage"
@@ -33,7 +34,10 @@ type Logger interface {
 }
 
 type Server struct {
-	auth           sigv4.Authenticator
+	auth       sigv4.Authenticator
+	authorizer interface {
+		Authorize(context.Context, sigv4.Authenticated, string) error
+	}
 	buckets        storage.BucketStore
 	metadata       storage.MetadataStore
 	objects        *objectservice.Service
@@ -42,8 +46,10 @@ type Server struct {
 	logger         Logger
 }
 
-func New(auth sigv4.Authenticator, buckets storage.BucketStore, metadata storage.MetadataStore, objects *objectservice.Service, maxObjectBytes int64, maxMetadataBytes int, logger Logger) *Server {
-	return &Server{auth: auth, buckets: buckets, metadata: metadata, objects: objects, maxObjectBytes: maxObjectBytes, maxMetadata: maxMetadataBytes, logger: logger}
+func New(auth sigv4.Authenticator, buckets storage.BucketStore, metadata storage.MetadataStore, objects *objectservice.Service, maxObjectBytes int64, maxMetadataBytes int, logger Logger, authorizer interface {
+	Authorize(context.Context, sigv4.Authenticated, string) error
+}) *Server {
+	return &Server{auth: auth, authorizer: authorizer, buckets: buckets, metadata: metadata, objects: objects, maxObjectBytes: maxObjectBytes, maxMetadata: maxMetadataBytes, logger: logger}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -59,6 +65,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if path == "/" {
+		if !s.authorize(w, r, identity, authorization.ListBuckets) {
+			return
+		}
 		s.handleService(w, r, identity.PrincipalID)
 		return
 	}
@@ -73,10 +82,42 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeS3Error(w, r, http.StatusBadRequest, "InvalidArgument", "The object key is not supported by this API subset.")
 			return
 		}
+		permission := map[string]string{http.MethodGet: authorization.GetObject, http.MethodHead: authorization.GetObject, http.MethodPut: authorization.PutObject, http.MethodDelete: authorization.DeleteObject}[r.Method]
+		if permission == "" {
+			methodNotAllowed(w, r, http.MethodGet+", "+http.MethodHead+", "+http.MethodPut+", "+http.MethodDelete)
+			return
+		}
+		if !s.authorize(w, r, identity, permission) {
+			return
+		}
 		s.handleObject(w, r, identity.PrincipalID, bucketName, key)
 		return
 	}
+	permission := map[string]string{http.MethodGet: authorization.ListObjects, http.MethodHead: authorization.ListObjects, http.MethodPut: authorization.CreateBucket, http.MethodDelete: authorization.DeleteBucket}[r.Method]
+	if permission == "" {
+		methodNotAllowed(w, r, http.MethodGet+", "+http.MethodHead+", "+http.MethodPut+", "+http.MethodDelete)
+		return
+	}
+	if !s.authorize(w, r, identity, permission) {
+		return
+	}
 	s.handleBucket(w, r, identity.PrincipalID, bucketName)
+}
+
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request, identity sigv4.Authenticated, permission string) bool {
+	if s.authorizer == nil {
+		writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request is not authorized.")
+		return false
+	}
+	if err := s.authorizer.Authorize(r.Context(), identity, permission); err != nil {
+		if errors.Is(err, authorization.ErrDenied) {
+			writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request is not authorized.")
+		} else {
+			writeError(w, r, err)
+		}
+		return false
+	}
+	return true
 }
 
 func (s *Server) handleService(w http.ResponseWriter, r *http.Request, principalID int64) {

@@ -28,9 +28,9 @@ see [license notes](docs/licensing.md).
    `/health/ready`, which
    reports whether StillFS can reach PostgreSQL. `/health/live` checks only
    that the HTTP process is responding.
-4. Create the first S3 credential locally with
-   `docker compose exec stillfs /app/stillfsctl credential create`. Save the
-   secret shown once. There is no default access key or HTTP credential API.
+4. Create an S3 credential locally with explicit permissions, for example
+   `docker compose exec stillfs /app/stillfsctl credential create --permission s3:ListBuckets --permission s3:CreateBucket --permission s3:PutObject --permission s3:GetObject --permission s3:DeleteObject`.
+   Save the secret shown once. There is no default access key or HTTP credential API.
 
 For frontend-only development, run `cd web && npm ci && npm run dev`; Vite
 proxies health requests to `localhost:9000`. Run the backend separately with
@@ -53,7 +53,8 @@ credential encryption key environment variables below. The frontend is at
 | `STILLFS_DB_SSLROOTCERT` | driver default | PostgreSQL CA certificate file |
 | `STILLFS_DB_MAX_OPEN_CONNS` | `10` | Maximum open pool connections |
 | `STILLFS_DB_MAX_IDLE_CONNS` | `5` | Maximum idle pool connections |
-| `STILLFS_CREDENTIAL_ENCRYPTION_KEY` | required | Base64 encoding of exactly 32 random bytes; encrypts credential secrets at rest |
+| `STILLFS_CREDENTIAL_ENCRYPTION_KEY` | required unless key file is set | Legacy Base64 encoding of exactly 32 random bytes |
+| `STILLFS_CREDENTIAL_ENCRYPTION_KEY_FILE` | optional alternative | Path to protected raw 32-byte key file (mode `0600`); configure only one key source |
 | `STILLFS_S3_REGION` | `us-east-1` | Only accepted SigV4 region |
 | `STILLFS_S3_CLOCK_SKEW` | `5m` | Maximum absolute request timestamp difference |
 | `STILLFS_MAX_OBJECT_BYTES` | `5368709120` | Maximum single PUT size in bytes |
@@ -81,10 +82,14 @@ The implemented path-style subset, SigV4 mode, errors, limits, and known
 compatibility gaps are listed in [docs/api/s3-v1.md](docs/api/s3-v1.md).
 Credential secrets are encrypted using AES-256-GCM under
 `STILLFS_CREDENTIAL_ENCRYPTION_KEY`; back up this key and keep it stable or
-existing credentials cannot be decrypted. Create another key for an existing
-principal with `stillfsctl credential create --principal-id ID`; revoke a key
-with `stillfsctl credential revoke ACCESS_KEY_ID`. Revocation disables that
-key but leaves its principal and buckets intact.
+existing credentials cannot be decrypted. New keys have no permissions unless
+explicit `--permission` flags are provided. Change grants with
+`stillfsctl credential permissions set ACCESS_KEY_ID`; revoke a key with
+`stillfsctl credential revoke ACCESS_KEY_ID`. Revocation disables that key but
+leaves its principal and buckets intact. See
+[authorization and local administration](docs/api/authorization-admin.md) for
+the fixed permission list, audit access, master-key rotation command, backup,
+and recovery procedure.
 
 The first credential command creates the principal. Use the generated Access
 Key ID and secret with a path-style SigV4 client in region `us-east-1`. The AWS

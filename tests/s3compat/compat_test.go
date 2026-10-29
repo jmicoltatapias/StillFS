@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/jmicoltatapias/stillfs/internal/authorization"
 	"github.com/jmicoltatapias/stillfs/internal/credential"
 	"github.com/jmicoltatapias/stillfs/internal/logging"
 	"github.com/jmicoltatapias/stillfs/internal/objectservice"
@@ -47,6 +48,9 @@ func TestAWSGoV2S3SubsetAgainstPostgresAndLocalStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create ephemeral test credential: %v", err)
 	}
+	if err := credentialStore.SetCredentialPermissions(ctx, created.AccessKeyID, []string{authorization.ListBuckets, authorization.ListObjects, authorization.CreateBucket, authorization.DeleteBucket, authorization.GetObject, authorization.PutObject, authorization.DeleteObject}); err != nil {
+		t.Fatal(err)
+	}
 	defer func() {
 		_ = manager.Revoke(context.Background(), created.AccessKeyID)
 	}()
@@ -62,21 +66,20 @@ func TestAWSGoV2S3SubsetAgainstPostgresAndLocalStorage(t *testing.T) {
 		Region: "us-east-1", MaxClockSkew: 5 * time.Minute,
 		Resolver: credential.Resolver{Store: credentialStore, Key: masterKey},
 	}
-	api := s3api.New(auth, postgres.NewBucketRepository(db), metadata, objects, 16<<20, 8<<10, logger)
+	api := s3api.New(auth, postgres.NewBucketRepository(db), metadata, objects, 16<<20, 8<<10, logger, authorization.Authorizer{Store: credentialStore})
 	httpServer := httptest.NewServer(api)
-	defer httpServer.Close()
+	defer func() { httpServer.Close() }()
 
 	provider := aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
 		return aws.Credentials{AccessKeyID: created.AccessKeyID, SecretAccessKey: created.Secret, Source: "ephemeral StillFS integration test"}, nil
 	})
-	client := s3.NewFromConfig(aws.Config{
-		Region:                     "us-east-1",
-		Credentials:                aws.NewCredentialsCache(provider),
-		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
-	}, func(options *s3.Options) {
-		options.BaseEndpoint = aws.String(httpServer.URL)
-		options.UsePathStyle = true
-	})
+	newClient := func(endpoint string) *s3.Client {
+		return s3.NewFromConfig(aws.Config{
+			Region: "us-east-1", Credentials: aws.NewCredentialsCache(provider),
+			RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+		}, func(options *s3.Options) { options.BaseEndpoint = aws.String(endpoint); options.UsePathStyle = true })
+	}
+	client := newClient(httpServer.URL)
 
 	bucket := fmt.Sprintf("sdk-compat-%d", time.Now().UnixNano())
 	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
@@ -162,6 +165,30 @@ func TestAWSGoV2S3SubsetAgainstPostgresAndLocalStorage(t *testing.T) {
 	}
 	if strings.Join(prefixes, ",") != "tree/a/,tree/b/" || strings.Join(keys, ",") != "tree/root" {
 		t.Fatalf("paginated listing keys=%v commonPrefixes=%v", keys, prefixes)
+	}
+
+	// Rotation changes ciphertext and the active key verifier atomically. Start
+	// a fresh server with the replacement key and exercise the SDK again.
+	httpServer.Close()
+	newMasterKey := make([]byte, 32)
+	for i := range newMasterKey {
+		newMasterKey[i] = 0x62
+	}
+	if count, err := credential.RotateMasterKey(ctx, credentialStore, masterKey, newMasterKey); err != nil || count != 1 {
+		t.Fatalf("rotate master key count=%d err=%v", count, err)
+	}
+	newAuth := sigv4.Authenticator{Region: "us-east-1", MaxClockSkew: 5 * time.Minute, Resolver: credential.Resolver{Store: credentialStore, Key: newMasterKey}}
+	api = s3api.New(newAuth, postgres.NewBucketRepository(db), metadata, objects, 16<<20, 8<<10, logger, authorization.Authorizer{Store: credentialStore})
+	httpServer = httptest.NewServer(api)
+	client = newClient(httpServer.URL)
+	postRotation, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("tree/root")})
+	if err != nil {
+		t.Fatalf("SDK GetObject after master-key rotation: %v", err)
+	}
+	postRotationBody, readErr := io.ReadAll(postRotation.Body)
+	closeErr := postRotation.Body.Close()
+	if readErr != nil || closeErr != nil || string(postRotationBody) != "payload:tree/root" {
+		t.Fatalf("SDK response after rotation=%q read=%v close=%v", postRotationBody, readErr, closeErr)
 	}
 
 	for _, key := range []string{"empty", "large/object.bin", "tree/a/one", "tree/a/two", "tree/b/one", "tree/root"} {

@@ -22,3 +22,20 @@ func TestEncryptDecryptAndBindAccessKey(t *testing.T) {
 		t.Fatal("ciphertext was accepted under a different access key ID")
 	}
 }
+
+func TestMasterKeyCheckIsKeyedAndRequiresAES256Key(t *testing.T) {
+	first, err := MasterKeyCheck(bytes.Repeat([]byte{1}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := MasterKeyCheck(bytes.Repeat([]byte{2}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first, second) {
+		t.Fatal("different master keys produced the same verifier")
+	}
+	if _, err := MasterKeyCheck([]byte("short")); err == nil {
+		t.Fatal("accepted invalid master-key length")
+	}
+}

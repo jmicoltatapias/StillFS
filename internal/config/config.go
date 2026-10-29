@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jmicoltatapias/stillfs/internal/securefile"
 )
 
 // Config contains the settings needed to run the initial HTTP process.
@@ -43,6 +45,16 @@ type DatabaseConfig struct {
 
 // Load reads configuration from the environment and validates it.
 func Load() (Config, error) {
+	return load(true)
+}
+
+// LoadForCredentialRotation loads database settings without requiring the
+// active master key; the rotation command reads old and new keys from files.
+func LoadForCredentialRotation() (Config, error) {
+	return load(false)
+}
+
+func load(requireCredentialKey bool) (Config, error) {
 	cfg := Config{
 		HTTPAddr:          envOr("STILLFS_HTTP_ADDR", ":9000"),
 		StorageRoot:       envOr("STILLFS_STORAGE_ROOT", "./data/objects"),
@@ -67,12 +79,25 @@ func Load() (Config, error) {
 			ConnectTimeout:  5 * time.Second,
 		},
 	}
-	if raw := os.Getenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY"); raw != "" {
-		key, err := base64.StdEncoding.DecodeString(raw)
-		if err != nil {
-			return Config{}, fmt.Errorf("STILLFS_CREDENTIAL_ENCRYPTION_KEY must be base64-encoded")
+	if requireCredentialKey {
+		encodedKey := os.Getenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY")
+		keyFile := os.Getenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY_FILE")
+		if encodedKey != "" && keyFile != "" {
+			return Config{}, fmt.Errorf("configure only one credential encryption key source")
 		}
-		cfg.CredentialEncryptionKey = key
+		if keyFile != "" {
+			key, err := securefile.ReadMasterKey(keyFile)
+			if err != nil {
+				return Config{}, fmt.Errorf("STILLFS_CREDENTIAL_ENCRYPTION_KEY_FILE must name a protected 32-byte key file")
+			}
+			cfg.CredentialEncryptionKey = key
+		} else if encodedKey != "" {
+			key, err := base64.StdEncoding.DecodeString(encodedKey)
+			if err != nil {
+				return Config{}, fmt.Errorf("STILLFS_CREDENTIAL_ENCRYPTION_KEY must be base64-encoded")
+			}
+			cfg.CredentialEncryptionKey = key
+		}
 	}
 	if raw := os.Getenv("STILLFS_S3_CLOCK_SKEW"); raw != "" {
 		parsed, err := time.ParseDuration(raw)
@@ -95,7 +120,7 @@ func Load() (Config, error) {
 	if raw := os.Getenv("STILLFS_MAX_METADATA_BYTES"); raw != "" {
 		cfg.MaxMetadataBytes = envInt("STILLFS_MAX_METADATA_BYTES", cfg.MaxMetadataBytes)
 	}
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.validate(requireCredentialKey); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -103,13 +128,17 @@ func Load() (Config, error) {
 
 // Validate rejects settings that would prevent a safe server startup.
 func (c Config) Validate() error {
+	return c.validate(true)
+}
+
+func (c Config) validate(requireCredentialKey bool) error {
 	if _, _, err := net.SplitHostPort(c.HTTPAddr); err != nil {
 		return fmt.Errorf("invalid HTTP address %q: %w", c.HTTPAddr, err)
 	}
 	if strings.TrimSpace(c.StorageRoot) == "" {
 		return fmt.Errorf("storage root must not be empty")
 	}
-	if len(c.CredentialEncryptionKey) != 32 {
+	if requireCredentialKey && len(c.CredentialEncryptionKey) != 32 {
 		return fmt.Errorf("credential encryption key must decode to exactly 32 bytes")
 	}
 	if strings.TrimSpace(c.S3Region) == "" || strings.ContainsAny(c.S3Region, "/ \t\r\n") {

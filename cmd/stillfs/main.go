@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/jmicoltatapias/stillfs/internal/authorization"
 	"github.com/jmicoltatapias/stillfs/internal/config"
 	"github.com/jmicoltatapias/stillfs/internal/credential"
 	"github.com/jmicoltatapias/stillfs/internal/httpapi"
@@ -46,18 +47,27 @@ func runMain() int {
 		logger.Error("database migration failed", map[string]interface{}{"error": err.Error()})
 		return 1
 	}
+	metadataRepository := postgres.NewMetadataRepository(db)
+	credentialRepository := postgres.NewCredentialRepository(db)
+	keyCheck, err := credential.MasterKeyCheck(cfg.CredentialEncryptionKey)
+	if err != nil {
+		logger.Error("credential encryption key is invalid", map[string]interface{}{"error": err.Error()})
+		return 1
+	}
 	objectStore, err := local.New(cfg.StorageRoot)
 	if err != nil {
 		logger.Error("object storage initialization failed", map[string]interface{}{"error": err.Error()})
 		return 1
 	}
-	metadataRepository := postgres.NewMetadataRepository(db)
-	credentialRepository := postgres.NewCredentialRepository(db)
+	if err := credentialRepository.EnsureCredentialMasterKey(ctx, keyCheck); err != nil {
+		logger.Error("credential encryption key verification failed", map[string]interface{}{"error": err.Error()})
+		return 1
+	}
 	objects := objectservice.New(objectStore, metadataRepository, logger)
 	api := s3api.New(sigv4.Authenticator{
 		Region: cfg.S3Region, MaxClockSkew: cfg.S3ClockSkew,
 		Resolver: credential.Resolver{Store: credentialRepository, Key: cfg.CredentialEncryptionKey},
-	}, postgres.NewBucketRepository(db), metadataRepository, objects, cfg.MaxObjectBytes, cfg.MaxMetadataBytes, logger)
+	}, postgres.NewBucketRepository(db), metadataRepository, objects, cfg.MaxObjectBytes, cfg.MaxMetadataBytes, logger, authorization.Authorizer{Store: credentialRepository})
 	if err := run(ctx, cfg, logger, postgres.Checker{DB: db}, api); err != nil {
 		logger.Error("server stopped with error", map[string]interface{}{"error": err.Error()})
 		return 1

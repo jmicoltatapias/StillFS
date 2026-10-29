@@ -65,3 +65,20 @@ owner and do not expose unowned buckets. New bucket creation requires a
 principal ID. Credential ciphertext uses AES-256-GCM in `BYTEA`, with its
 nonce stored separately and a required external master key. This is credential
 material, not object payload data or an IAM policy model.
+
+Migration `0003_authorization_audit.sql` adds a fixed permission set per access
+key and a PostgreSQL audit table. No permission rows are backfilled, so
+existing credentials are denied S3 operations until an operator grants
+permissions with `stillfsctl`. Audit events for credential creation,
+revocation, and permission replacement share a transaction with the change.
+PostgreSQL operators can still alter audit rows; no immutable storage or
+retention policy is configured. See [authorization and local administration](../api/authorization-admin.md).
+
+Migration `0004_credential_master_key_state.sql` stores one HMAC verifier and
+generation counter for the active credential-encryption key; encrypted
+credential columns keep their existing AES-256-GCM format. Server startup
+checks the configured key, and credential lookup reads the verifier and
+ciphertext together. Rotation locks credential-management writes and updates
+all encrypted secrets, nonce values, the verifier, and the success audit event
+in one transaction. See the operational recovery procedure in
+`docs/api/authorization-admin.md`.

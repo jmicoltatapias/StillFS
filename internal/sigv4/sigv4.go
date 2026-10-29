@@ -41,6 +41,7 @@ type Authenticator struct {
 }
 
 type Authenticated struct {
+	AccessKeyID string
 	PrincipalID int64
 	PayloadHash string
 }
@@ -155,13 +156,13 @@ func (a Authenticator) Authenticate(ctx context.Context, request *http.Request) 
 	if subtle.ConstantTimeCompare(provided, want) != 1 {
 		return Authenticated{}, authError("SignatureDoesNotMatch", http.StatusForbidden, nil)
 	}
-	return Authenticated{PrincipalID: credential.PrincipalID, PayloadHash: payloadHash}, nil
+	return Authenticated{AccessKeyID: parsed.accessKeyID, PrincipalID: credential.PrincipalID, PayloadHash: payloadHash}, nil
 }
 
 type authorization struct {
 	algorithm       string
-	credentialScope string
 	accessKeyID     string
+	credentialScope string
 	signedHeaders   []string
 	signature       string
 }

@@ -5,15 +5,34 @@ package credential
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"io"
 )
 
+var keyCheckContext = []byte("StillFS credential master-key check v1")
+
+// MasterKeyCheck returns a keyed verifier used to ensure all StillFS processes
+// and credential writers use the active encryption key. It is not reversible.
+func MasterKeyCheck(masterKey []byte) ([]byte, error) {
+	if len(masterKey) != 32 {
+		return nil, fmt.Errorf("credential encryption key must contain 32 bytes")
+	}
+	mac := hmac.New(sha256.New, masterKey)
+	_, _ = mac.Write(keyCheckContext)
+	return mac.Sum(nil), nil
+}
+
 // Encrypt protects a secret at rest using AES-256-GCM and binds its ciphertext
 // to the access key ID as associated data.
 func Encrypt(masterKey []byte, accessKeyID, secret string) (ciphertext, nonce []byte, err error) {
+	return encryptBytes(masterKey, accessKeyID, []byte(secret))
+}
+
+func encryptBytes(masterKey []byte, accessKeyID string, secret []byte) (ciphertext, nonce []byte, err error) {
 	aead, err := newAEAD(masterKey)
 	if err != nil {
 		return nil, nil, err
@@ -22,25 +41,33 @@ func Encrypt(masterKey []byte, accessKeyID, secret string) (ciphertext, nonce []
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, nil, fmt.Errorf("generate credential nonce: %w", err)
 	}
-	ciphertext = aead.Seal(nil, nonce, []byte(secret), []byte(accessKeyID))
+	ciphertext = aead.Seal(nil, nonce, secret, []byte(accessKeyID))
 	return ciphertext, nonce, nil
 }
 
 // Decrypt opens a stored SigV4 secret. Plaintext must only be retained for the
 // duration of request verification and must never be logged or returned.
 func Decrypt(masterKey []byte, accessKeyID string, ciphertext, nonce []byte) (string, error) {
-	aead, err := newAEAD(masterKey)
+	plaintext, err := decryptBytes(masterKey, accessKeyID, ciphertext, nonce)
 	if err != nil {
 		return "", err
 	}
+	return string(plaintext), nil
+}
+
+func decryptBytes(masterKey []byte, accessKeyID string, ciphertext, nonce []byte) ([]byte, error) {
+	aead, err := newAEAD(masterKey)
+	if err != nil {
+		return nil, err
+	}
 	if len(nonce) != aead.NonceSize() {
-		return "", fmt.Errorf("invalid credential nonce")
+		return nil, fmt.Errorf("invalid credential nonce")
 	}
 	plaintext, err := aead.Open(nil, nonce, ciphertext, []byte(accessKeyID))
 	if err != nil {
-		return "", fmt.Errorf("decrypt credential secret: %w", err)
+		return nil, fmt.Errorf("decrypt credential secret: %w", err)
 	}
-	return string(plaintext), nil
+	return plaintext, nil
 }
 
 func newAEAD(masterKey []byte) (cipher.AEAD, error) {

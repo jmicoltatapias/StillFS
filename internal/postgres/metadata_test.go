@@ -47,6 +47,9 @@ func TestValidateMetadata(t *testing.T) {
 }
 
 func TestMapDBError(t *testing.T) {
+	if err := mapDBError(nil); err != nil {
+		t.Fatalf("mapDBError(nil) = %v", err)
+	}
 	for _, tt := range []struct {
 		code string
 		want error

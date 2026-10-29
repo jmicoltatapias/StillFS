@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jmicoltatapias/stillfs/internal/authorization"
 	"github.com/jmicoltatapias/stillfs/internal/credential"
 	"github.com/jmicoltatapias/stillfs/internal/logging"
 	"github.com/jmicoltatapias/stillfs/internal/objectservice"
@@ -98,6 +100,14 @@ func TestS3APIWithPostgresAndLocalStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create API test credential: %v", err)
 	}
+	if err := credentialStore.SetCredentialPermissions(ctx, created.AccessKeyID, testS3Permissions()); err != nil {
+		t.Fatal(err)
+	}
+	restricted, err := manager.Create(ctx, created.PrincipalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Revoke(context.Background(), restricted.AccessKeyID)
 	bytesStore, err := local.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -108,11 +118,16 @@ func TestS3APIWithPostgresAndLocalStore(t *testing.T) {
 	api := s3api.New(sigv4.Authenticator{
 		Region: "us-east-1", MaxClockSkew: 5 * time.Minute,
 		Resolver: credential.Resolver{Store: credentialStore, Key: masterKey},
-	}, NewBucketRepository(db), metadata, service, 1<<20, 8<<10, logger)
+	}, NewBucketRepository(db), metadata, service, 1<<20, 8<<10, logger, authorization.Authorizer{Store: credentialStore})
 	call := func(method, target string, body []byte) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
 		api.ServeHTTP(recorder, signS3Request(t, method, target, body, created.AccessKeyID, created.Secret))
 		return recorder
+	}
+	denied := httptest.NewRecorder()
+	api.ServeHTTP(denied, signS3Request(t, http.MethodGet, "http://stillfs.test/not-visible/object", nil, restricted.AccessKeyID, restricted.Secret))
+	if denied.Code != http.StatusForbidden || !strings.Contains(denied.Body.String(), "<Code>AccessDenied</Code>") || strings.Contains(denied.Body.String(), "NoSuchBucket") {
+		t.Fatalf("credential without grant response = %d %s", denied.Code, denied.Body.String())
 	}
 	bucket := fmt.Sprintf("s3-it-%d", time.Now().UnixNano())
 	if response := call(http.MethodPut, "http://stillfs.test/"+bucket, nil); response.Code != http.StatusOK {
@@ -141,6 +156,216 @@ func TestS3APIWithPostgresAndLocalStore(t *testing.T) {
 	if response := call(http.MethodDelete, "http://stillfs.test/"+bucket, nil); response.Code != http.StatusNoContent {
 		t.Fatalf("S3 DELETE bucket = %d %s", response.Code, response.Body.String())
 	}
+}
+
+func TestCredentialMasterKeyRotationIsTransactionalAndPreservesState(t *testing.T) {
+	db, cleanup := openIntegrationDB(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	repository := NewCredentialRepository(db)
+	oldKey, newKey := bytes.Repeat([]byte{0x21}, 32), bytes.Repeat([]byte{0x42}, 32)
+	manager := credential.Manager{Store: repository, Key: oldKey}
+	first, err := manager.Create(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Create(ctx, first.PrincipalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := manager.Create(ctx, first.PrincipalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SetCredentialPermissions(ctx, first.AccessKeyID, []string{authorization.ListBuckets, authorization.GetObject}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SetCredentialPermissions(ctx, second.AccessKeyID, []string{authorization.PutObject}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Revoke(ctx, revoked.AccessKeyID); err != nil {
+		t.Fatal(err)
+	}
+
+	localStore, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := NewMetadataRepository(db)
+	bucket, err := NewBucketRepository(db).CreateBucket(ctx, first.PrincipalID, fmt.Sprintf("rotate-it-%d", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := objectservice.New(localStore, metadata, logging.New(io.Discard))
+	objectID := storage.ObjectID{Bucket: bucket.Name, Key: "keep/object"}
+	const objectContent = "rotation must not touch object bytes"
+	if err := objects.Put(ctx, objectID, "text/plain", strings.NewReader(objectContent)); err != nil {
+		t.Fatal(err)
+	}
+	beforeMetadata, err := metadata.Get(ctx, objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCipher, err := repository.GetCredential(ctx, first.AccessKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wrong := bytes.Repeat([]byte{0x33}, 32)
+	if _, err := credential.RotateMasterKey(ctx, repository, wrong, newKey); !errors.Is(err, credential.ErrMasterKeyMismatch) {
+		t.Fatalf("wrong old key error = %v", err)
+	}
+	if _, err := credential.RotateMasterKey(ctx, repository, oldKey, newKey[:31]); !errors.Is(err, credential.ErrInvalidMasterKey) {
+		t.Fatalf("invalid new key error = %v", err)
+	}
+	if _, err := credential.VerifyMasterKey(ctx, repository, oldKey); err != nil {
+		t.Fatalf("old key failed after rejected attempts: %v", err)
+	}
+
+	corrupt := append([]byte(nil), beforeCipher.EncryptedSecret...)
+	corrupt[len(corrupt)-1] ^= 0x80
+	if _, err := db.ExecContext(ctx, `UPDATE credentials SET secret_ciphertext=$2 WHERE access_key_id=$1`, first.AccessKeyID, corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credential.RotateMasterKey(ctx, repository, oldKey, newKey); !errors.Is(err, credential.ErrInvalidCredentialData) {
+		t.Fatalf("corrupted ciphertext rotation error = %v", err)
+	}
+	afterFailure, err := repository.GetCredential(ctx, first.AccessKeyID)
+	if err != nil || !bytes.Equal(afterFailure.EncryptedSecret, corrupt) {
+		t.Fatalf("failed rotation changed ciphertext: err=%v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE credentials SET secret_ciphertext=$2 WHERE access_key_id=$1`, first.AccessKeyID, beforeCipher.EncryptedSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.ExecContext(ctx, `CREATE FUNCTION stillfs_reject_credential_rotation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected rotation failure'; END $$; CREATE TRIGGER stillfs_reject_credential_rotation BEFORE UPDATE OF secret_ciphertext ON credentials FOR EACH ROW EXECUTE FUNCTION stillfs_reject_credential_rotation()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credential.RotateMasterKey(ctx, repository, oldKey, newKey); err == nil {
+		t.Fatal("database-triggered rotation failure unexpectedly succeeded")
+	}
+	if _, err := db.ExecContext(ctx, `DROP TRIGGER stillfs_reject_credential_rotation ON credentials; DROP FUNCTION stillfs_reject_credential_rotation()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credential.VerifyMasterKey(ctx, repository, oldKey); err != nil {
+		t.Fatalf("old key failed after transaction rollback: %v", err)
+	}
+
+	oldCheck, _ := credential.MasterKeyCheck(oldKey)
+	newCheck, _ := credential.MasterKeyCheck(newKey)
+	started, release := make(chan struct{}), make(chan struct{})
+	rotationDone := make(chan error, 1)
+	var once sync.Once
+	go func() {
+		_, err := repository.RotateCredentialSecrets(ctx, oldCheck, newCheck, func(id string, ciphertext, nonce []byte) ([]byte, []byte, error) {
+			plain, err := credential.Decrypt(oldKey, id, ciphertext, nonce)
+			if err != nil {
+				return nil, nil, err
+			}
+			newCipher, newNonce, err := credential.Encrypt(newKey, id, plain)
+			if err != nil {
+				return nil, nil, err
+			}
+			once.Do(func() { close(started); <-release })
+			return newCipher, newNonce, nil
+		})
+		rotationDone <- err
+	}()
+	<-started
+	staleCreateDone := make(chan error, 1)
+	go func() { _, err := manager.Create(ctx, first.PrincipalID); staleCreateDone <- err }()
+	select {
+	case err := <-staleCreateDone:
+		t.Fatalf("credential create did not wait for rotation lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-rotationDone; err != nil {
+		t.Fatalf("rotate credentials: %v", err)
+	}
+	if err := <-staleCreateDone; !errors.Is(err, storage.ErrMasterKeyMismatch) {
+		t.Fatalf("stale-key concurrent create error = %v", err)
+	}
+
+	if count, err := credential.VerifyMasterKey(ctx, repository, newKey); err != nil || count != 3 {
+		t.Fatalf("verify rotated key count=%d err=%v", count, err)
+	}
+	if _, err := credential.VerifyMasterKey(ctx, repository, oldKey); !errors.Is(err, credential.ErrMasterKeyMismatch) {
+		t.Fatalf("old key after rotation error = %v", err)
+	}
+	events, err := repository.ListAuditEvents(ctx, 0, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawRotationSuccess := false
+	for _, event := range events {
+		if event.Action == "credential.master-key-rotation.succeeded" && event.Target == "credential-count:3" {
+			sawRotationSuccess = true
+		}
+		if strings.Contains(event.Actor, first.Secret) || strings.Contains(event.Action, first.Secret) || strings.Contains(event.Target, first.Secret) {
+			t.Fatal("audit event exposed plaintext credential secret")
+		}
+	}
+	if !sawRotationSuccess {
+		t.Fatal("successful rotation audit event was not committed with the transaction")
+	}
+	if err := repository.EnsureCredentialMasterKey(ctx, oldCheck); !errors.Is(err, storage.ErrMasterKeyMismatch) {
+		t.Fatalf("startup accepted stale master-key verifier: %v", err)
+	}
+	for _, item := range []struct {
+		access, secret string
+		revoked        bool
+	}{{first.AccessKeyID, first.Secret, false}, {second.AccessKeyID, second.Secret, false}, {revoked.AccessKeyID, revoked.Secret, true}} {
+		resolved, err := (credential.Resolver{Store: repository, Key: newKey}).Resolve(ctx, item.access)
+		if err != nil || resolved.Active == item.revoked || (!item.revoked && resolved.Secret != item.secret) {
+			t.Fatalf("credential after rotation active=%v err=%v", resolved.Active, err)
+		}
+	}
+	for _, grant := range []struct {
+		access     string
+		permission string
+		want       bool
+	}{{first.AccessKeyID, authorization.ListBuckets, true}, {first.AccessKeyID, authorization.PutObject, false}, {second.AccessKeyID, authorization.PutObject, true}, {revoked.AccessKeyID, authorization.PutObject, false}} {
+		allowed, err := repository.HasCredentialPermission(ctx, grant.access, first.PrincipalID, grant.permission)
+		if err != nil || allowed != grant.want {
+			t.Fatalf("permission %s after rotation = %v err=%v want=%v", grant.permission, allowed, err, grant.want)
+		}
+	}
+	newManager := credential.Manager{Store: repository, Key: newKey}
+	replacement, err := newManager.Create(ctx, first.PrincipalID)
+	if err != nil {
+		t.Fatalf("create replacement credential under new key: %v", err)
+	}
+	if allowed, err := repository.HasCredentialPermission(ctx, replacement.AccessKeyID, first.PrincipalID, authorization.GetObject); err != nil || allowed {
+		t.Fatalf("replacement credential was granted permissions automatically: allowed=%v err=%v", allowed, err)
+	}
+	if err := repository.SetCredentialPermissions(ctx, replacement.AccessKeyID, []string{authorization.GetObject}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := repository.HasCredentialPermission(ctx, replacement.AccessKeyID, first.PrincipalID, authorization.GetObject); err != nil || !allowed {
+		t.Fatalf("explicit replacement grant failed: allowed=%v err=%v", allowed, err)
+	}
+	afterMetadata, err := metadata.Get(ctx, objectID)
+	if err != nil || afterMetadata.ID != beforeMetadata.ID || afterMetadata.Bucket != beforeMetadata.Bucket || afterMetadata.Key != beforeMetadata.Key || afterMetadata.StorageRef != beforeMetadata.StorageRef || afterMetadata.ContentLength != beforeMetadata.ContentLength || afterMetadata.ContentType != beforeMetadata.ContentType || afterMetadata.ETag != beforeMetadata.ETag || afterMetadata.ChecksumAlgorithm != beforeMetadata.ChecksumAlgorithm || afterMetadata.Checksum != beforeMetadata.Checksum || !afterMetadata.CreatedAt.Equal(beforeMetadata.CreatedAt) || !afterMetadata.UpdatedAt.Equal(beforeMetadata.UpdatedAt) {
+		t.Fatalf("object metadata changed during rotation: before=%#v after=%#v err=%v", beforeMetadata, afterMetadata, err)
+	}
+	reader, err := localStore.Open(ctx, afterMetadata.StorageRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || string(content) != objectContent {
+		t.Fatalf("object bytes changed: content=%q read=%v close=%v", content, readErr, closeErr)
+	}
+}
+
+func testS3Permissions() []string {
+	return []string{authorization.ListBuckets, authorization.ListObjects, authorization.CreateBucket, authorization.DeleteBucket, authorization.GetObject, authorization.PutObject, authorization.DeleteObject}
 }
 
 // This test uses a fresh per-test schema in an explicitly supplied disposable DB.
@@ -236,12 +461,59 @@ func TestPostgresMetadataRepositories(t *testing.T) {
 	if err != nil || loadedCredential.RevokedAt != nil || string(loadedCredential.EncryptedSecret) != "authenticated ciphertext" {
 		t.Fatalf("load active credential = (%#v, %v)", loadedCredential, err)
 	}
+	allowed, err := credentials.HasCredentialPermission(ctx, credential.AccessKeyID, principalID, authorization.GetObject)
+	if err != nil || allowed {
+		t.Fatalf("new credential permission = %v, %v; want deny by default", allowed, err)
+	}
+	if err := credentials.SetCredentialPermissions(ctx, credential.AccessKeyID, []string{authorization.GetObject}); err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = credentials.HasCredentialPermission(ctx, credential.AccessKeyID, principalID, authorization.GetObject)
+	if err != nil || !allowed {
+		t.Fatalf("granted permission = %v, %v", allowed, err)
+	}
+	allowed, err = credentials.HasCredentialPermission(ctx, credential.AccessKeyID, principalID, authorization.PutObject)
+	if err != nil || allowed {
+		t.Fatalf("ungranted permission = %v, %v", allowed, err)
+	}
+	secondKey, err := credentials.CreateCredential(ctx, storage.Credential{AccessKeyID: "other-key-" + suffix, PrincipalID: principalID, EncryptedSecret: []byte("other ciphertext"), Nonce: make([]byte, 12)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = credentials.HasCredentialPermission(ctx, secondKey.AccessKeyID, principalID, authorization.GetObject)
+	if err != nil || allowed {
+		t.Fatalf("same-principal key inherited permissions: %v, %v", allowed, err)
+	}
+	allowed, err = credentials.HasCredentialPermission(ctx, credential.AccessKeyID, principalID+1, authorization.GetObject)
+	if err != nil || allowed {
+		t.Fatalf("credential permission crossed principal boundary: %v, %v", allowed, err)
+	}
+	events, err := credentials.ListAuditEvents(ctx, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawCreate, sawPermission bool
+	for _, event := range events {
+		if event.Target == credential.AccessKeyID && event.Action == "credential.create" {
+			sawCreate = true
+		}
+		if event.Target == credential.AccessKeyID && event.Action == "credential.permissions.set" {
+			sawPermission = true
+		}
+	}
+	if !sawCreate || !sawPermission {
+		t.Fatalf("credential audit events missing: create=%v permissions=%v", sawCreate, sawPermission)
+	}
 	if err := credentials.RevokeCredential(ctx, credential.AccessKeyID); err != nil {
 		t.Fatalf("revoke credential: %v", err)
 	}
 	loadedCredential, err = credentials.GetCredential(ctx, credential.AccessKeyID)
 	if err != nil || loadedCredential.RevokedAt == nil {
 		t.Fatalf("load revoked credential = (%#v, %v)", loadedCredential, err)
+	}
+	allowed, err = credentials.HasCredentialPermission(ctx, credential.AccessKeyID, principalID, authorization.GetObject)
+	if err != nil || allowed {
+		t.Fatalf("revoked credential retained a grant: %v, %v", allowed, err)
 	}
 	if err := credentials.RevokeCredential(ctx, "missing-"+suffix); !errors.Is(err, storage.ErrCredentialNotFound) {
 		t.Fatalf("revoke missing credential error = %v", err)

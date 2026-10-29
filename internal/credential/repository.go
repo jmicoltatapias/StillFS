@@ -3,6 +3,7 @@ package credential
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -25,6 +26,12 @@ func (r Resolver) Resolve(ctx context.Context, accessKeyID string) (sigv4.Creden
 	}
 	if err != nil {
 		return sigv4.Credential{}, err
+	}
+	if len(stored.MasterKeyCheck) != 0 {
+		check, checkErr := MasterKeyCheck(r.Key)
+		if checkErr != nil || subtle.ConstantTimeCompare(check, stored.MasterKeyCheck) != 1 {
+			return sigv4.Credential{}, ErrMasterKeyMismatch
+		}
 	}
 	if stored.RevokedAt != nil {
 		return sigv4.Credential{PrincipalID: stored.PrincipalID, Active: false}, nil
@@ -63,9 +70,13 @@ func (m Manager) Create(ctx context.Context, principalID int64) (Created, error)
 	if err != nil {
 		return Created{}, err
 	}
+	keyCheck, err := MasterKeyCheck(m.Key)
+	if err != nil {
+		return Created{}, err
+	}
 	stored, err := m.Store.CreateCredential(ctx, storage.Credential{
 		AccessKeyID: accessKeyID, PrincipalID: principalID,
-		EncryptedSecret: ciphertext, Nonce: nonce,
+		EncryptedSecret: ciphertext, Nonce: nonce, MasterKeyCheck: keyCheck,
 	})
 	if err != nil {
 		return Created{}, err

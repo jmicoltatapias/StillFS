@@ -45,14 +45,19 @@ Estos puntos vienen de la solicitud de fase inicial y delimitan este incremento:
   /health/ready` responde 200 con `{"status":"ok","database":"ok"}` si la
   base responde, o 503 con `{"status":"not_ready","database":"unavailable"}`.
 - El servidor aplica migraciones numeradas al inicio en transacciones
-  individuales. `0001` crea buckets/objetos y `0002` añade principals,
-  credenciales cifradas y ownership nullable de buckets.
+  individuales. `0001` crea buckets/objetos, `0002` añade principals,
+  credenciales cifradas y ownership nullable de buckets; `0003` añade permisos
+  por clave/auditoría, y `0004` añade verificación de la clave maestra.
 - La tarea 004 añade un subconjunto path-style de S3 API v1, autenticado con
   SigV4 de cabecera, scope de región `s3` y payload SHA-256 firmado. No se
   declara compatibilidad general con S3.
 - Los buckets se asignan a principals. Los buckets anteriores a la migración
   `0002` permanecen sin owner y no se exponen por S3 hasta una asignación
   explícita.
+- La tarea 006 añade permisos fijos por credencial S3 con denegación por
+  defecto y auditoría PostgreSQL de cambios de credenciales/permisos. No añade
+  IAM de AWS ni una API administrativa HTTP; la gestión sigue siendo local
+  mediante `stillfsctl`.
 - La UI de estado vive bajo `/console/`; `/` queda reservado para listar
   buckets autenticados.
 - La UI se sirve desde `web/dist` cuando existe el artefacto generado; Vite usa
@@ -74,7 +79,7 @@ Estos puntos vienen de la solicitud de fase inicial y delimitan este incremento:
   iniciar.
 - Uso multiproceso de una raíz local, garantías específicas por filesystem y
   pruebas de caída abrupta.
-- IAM/policies completos, rotación de clave maestra, TLS integrado, controles
+- IAM/policies completos, TLS integrado, controles
   anti-replay adicionales y políticas de secretos fuera del entorno de
   desarrollo.
 - Pruebas de interoperabilidad con AWS CLI y otros SDKs; la tarea 005 ejecutó

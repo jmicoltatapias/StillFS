@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -77,7 +79,37 @@ func TestLoadRejectsInvalidDatabasePort(t *testing.T) {
 
 func TestLoadRequiresCredentialEncryptionKey(t *testing.T) {
 	t.Setenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY", "")
+	t.Setenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY_FILE", "")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() succeeded without the credential encryption key")
+	}
+}
+
+func TestLoadReadsProtectedMasterKeyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "active.key")
+	want := bytes.Repeat([]byte{0x31}, 32)
+	if err := os.WriteFile(path, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY", "")
+	t.Setenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY_FILE", path)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cfg.CredentialEncryptionKey, want) {
+		t.Fatal("loaded key file differs")
+	}
+}
+
+func TestLoadForCredentialRotationDoesNotRequireOrInspectMasterKey(t *testing.T) {
+	t.Setenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY", "not base64")
+	t.Setenv("STILLFS_CREDENTIAL_ENCRYPTION_KEY_FILE", "/does/not/exist")
+	cfg, err := LoadForCredentialRotation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.CredentialEncryptionKey) != 0 {
+		t.Fatal("rotation config unexpectedly loaded a master key")
 	}
 }
